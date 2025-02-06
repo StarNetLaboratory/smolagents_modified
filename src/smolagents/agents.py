@@ -801,6 +801,7 @@ class CodeAgent(MultiStepAgent):
         planning_interval (`int`, *optional*): Interval at which the agent will run a planning step.
         use_e2b_executor (`bool`, default `False`): Whether to use the E2B executor for remote code execution.
         max_print_outputs_length (`int`, *optional*): Maximum length of the print outputs.
+        permission ('bool', default 'True'): Model asks the user permission to execute proposed code at each step.
         **kwargs: Additional keyword arguments.
 
     """
@@ -815,15 +816,19 @@ class CodeAgent(MultiStepAgent):
         planning_interval: Optional[int] = None,
         use_e2b_executor: bool = False,
         max_print_outputs_length: Optional[int] = None,
+        permission: bool = True,  # ✅ Add permission flag (default: True)
         **kwargs,
     ):
         if system_prompt is None:
             system_prompt = CODE_SYSTEM_PROMPT
 
+        self.permission = permission  # ✅ Store permission flag
         self.additional_authorized_imports = additional_authorized_imports if additional_authorized_imports else []
         self.authorized_imports = list(set(BASE_BUILTIN_MODULES) | set(self.additional_authorized_imports))
+
         if "{{authorized_imports}}" not in system_prompt:
             raise ValueError("Tag '{{authorized_imports}}' should be provided in the prompt.")
+
         super().__init__(
             tools=tools,
             model=model,
@@ -875,7 +880,6 @@ class CodeAgent(MultiStepAgent):
         Returns None if the step is not final.
         """
         memory_messages = self.write_memory_to_messages()
-
         self.input_messages = memory_messages.copy()
 
         # Add new step in logs
@@ -899,7 +903,7 @@ class CodeAgent(MultiStepAgent):
             level=LogLevel.DEBUG,
         )
 
-        # Parse
+        # Parse the code output
         try:
             code_action = fix_final_answer_code(parse_code_blobs(model_output))
         except Exception as e:
@@ -914,7 +918,16 @@ class CodeAgent(MultiStepAgent):
             )
         ]
 
-        # Execute
+        # ✅ NEW: Prompt the user for permission unless permission=False
+        if self.permission:
+            print("\n🚨 **Agent wants to execute the following code:**\n")
+            print(f"```python\n{code_action}\n```")
+            response = input("\nDo you want to execute this code? (yes/no): ").strip().lower()
+            if response not in ["y", "yes"]:
+                print("🚫 Execution aborted by the user.")
+                return None
+
+        # ✅ If permission=False or user agrees, execute the code
         self.logger.log_code(title="Executing parsed code:", content=code_action, level=LogLevel.INFO)
         is_final_answer = False
         try:
