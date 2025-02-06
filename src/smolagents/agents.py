@@ -918,14 +918,19 @@ class CodeAgent(MultiStepAgent):
             )
         ]
 
-        # ✅ NEW: Prompt the user for permission unless permission=False
+        # ✅ Prompt the user for permission unless permission=False
         if self.permission:
             print("\n🚨 **Agent wants to execute the following code:**\n")
             print(f"```python\n{code_action}\n```")
-            response = input("\nDo you want to execute this code? (yes/no): ").strip().lower()
-            if response not in ["y", "yes"]:
-                print("🚫 Execution aborted by the user.")
-                return None
+
+            # ✅ User prompt: Press Enter (default Yes), type "y" or "yes" to execute, or "no" to abort
+            response = input("\nPress Enter to execute, or type 'no' to abort: ").strip().lower()
+
+            if response == "no":
+                print("🚫 Execution aborted by the user. Exiting program.")
+                sys.exit(1)  # ✅ Exit the program completely
+            else:
+                print("✅ Proceeding with execution.")
 
         # ✅ If permission=False or user agrees, execute the code
         self.logger.log_code(title="Executing parsed code:", content=code_action, level=LogLevel.INFO)
