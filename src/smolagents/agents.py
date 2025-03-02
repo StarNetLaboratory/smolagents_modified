@@ -1393,7 +1393,7 @@ Do NOT return critic feedback as your answer. Fix the problems and submit an imp
     Please refine the solution considering these factors and re-evaluate."""
                         # critic_step.feedback = default_feedback
                         # critic_feedback = default_feedback
-                    critic_step.feedback = critic_feedback
+                critic_step.feedback = critic_feedback
 
             # Determine acceptance based on final feedback
             lower_feedback = critic_feedback.lower()
