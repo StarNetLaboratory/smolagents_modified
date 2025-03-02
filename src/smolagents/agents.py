@@ -1381,7 +1381,7 @@ Do not use placeholders. Provide specific, actionable feedback."""
 Please refine the solution considering these factors and re-evaluate."""
                     # critic_step.feedback = default_feedback
                     # critic_feedback = default_feedback
-                    critic_step.feedback = critic_feedback
+            critic_step.feedback = critic_feedback
                 
         # Determine acceptance based on final feedback
         lower_feedback = critic_feedback.lower()
