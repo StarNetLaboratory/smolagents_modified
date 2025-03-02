@@ -982,7 +982,7 @@ class CodeAgent(MultiStepAgent):
 
 class CriticCodeAgent(CodeAgent):
     """
-    An enhanced CodeAgent with a critic capability that reviews code before execution.
+    A CodeAgent with a critic capability that reviews code before execution.
     
     The critic checks for typos, errors, and logical issues before allowing code execution.
     If the critic does not accept the proposed code, the main agent revises its approach.
@@ -1015,6 +1015,14 @@ class CriticCodeAgent(CodeAgent):
         revision_prompt: Optional[str] = None,
         **kwargs,
     ):
+        # Ensure the system prompt includes the managed_agents_descriptions placeholder
+        if system_prompt is None:
+            # Use default CodeAgent system prompt which should include the placeholder
+            pass
+        elif "{{managed_agents_descriptions}}" not in system_prompt:
+            # Add the placeholder if it's missing
+            system_prompt = system_prompt + "\n\n{{managed_agents_descriptions}}"
+        
         super().__init__(tools=tools, model=model, system_prompt=system_prompt, **kwargs)
         
         # Default critic system prompt
@@ -1047,14 +1055,19 @@ Your feedback will be used to improve the code before execution."""
             # Import here to avoid circular imports
             from smolagents import ToolCallingAgent
             
+            critic_system_prompt = self.critic_system_prompt
+            if "{{managed_agents_descriptions}}" not in critic_system_prompt:
+                critic_system_prompt = critic_system_prompt + "\n\n{{managed_agents_descriptions}}"
+            
             # Create a ToolCallingAgent internally as the critic
             self.critic_agent = ToolCallingAgent(
                 tools=[],  # No tools needed for critique
                 model=critic_model_to_use,
                 verbosity_level=self.logger.level,  # Match main agent's verbosity
-                system_prompt=self.critic_system_prompt,
+                system_prompt=critic_system_prompt,
                 name="CriticAgent",
-                description="Reviews code and reasoning without executing it. Provides ACCEPT or NOT ACCEPT decisions."
+                description="Reviews code and reasoning without executing it. Provides ACCEPT or NOT ACCEPT decisions.",
+                add_base_tools=False,
             )
             
             # We don't need these anymore since we're always using a critic agent
@@ -1295,5 +1308,5 @@ Provide your analysis and conclude with either ACCEPT or NOT ACCEPT."""
         critic_step.duration = critic_step.end_time - critic_step.start_time
         
         return critic_step
-
+        
 __all__ = ["MultiStepAgent", "CodeAgent", "ToolCallingAgent", "AgentMemory", "CriticCodeAgent"]
