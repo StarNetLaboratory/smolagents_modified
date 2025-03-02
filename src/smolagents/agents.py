@@ -1368,23 +1368,23 @@ Do NOT return critic feedback as your answer. Fix the problems and submit an imp
                     Do not use placeholders. Provide specific, actionable feedback."""
                 
                 retry_response = self.critic_agent.run(retry_request, reset=True)
-                print(f'{retry_response=}')
-            if hasattr(retry_response, 'content'):
-                if isinstance(retry_response.content, list):
-                    retry_feedback = " ".join(map(str, retry_response.content)).strip()  # Convert list to string
+                
+                if hasattr(retry_response, 'content'):
+                    if isinstance(retry_response.content, list):
+                        retry_feedback = " ".join(map(str, retry_response.content)).strip()  # Convert list to string
+                    else:
+                        retry_feedback = str(retry_response.content).strip()
                 else:
-                    retry_feedback = str(retry_response.content).strip()
-            else:
-                retry_feedback = str(retry_response).strip()
+                    retry_feedback = str(retry_response).strip()
 
-            # Use retry response if it is properly formatted
-            if retry_feedback.startswith(("ACCEPT:", "NOT ACCEPT:", "NOT SURE:")):
-                critic_feedback = retry_feedback
-                critic_step.feedback = retry_feedback
+                # Use retry response if it is properly formatted
+                if retry_feedback.startswith(("ACCEPT:", "NOT ACCEPT:", "NOT SURE:")):
+                    critic_feedback = retry_feedback
+                    critic_step.feedback = retry_feedback
 
             else:
-                # Provide a structured fallback if the retry still fails
-                critic_feedback = """NOT SURE: The proposed solution may need improvements:
+            # Provide a structured fallback if the retry still fails
+            critic_feedback = """NOT SURE: The proposed solution may need improvements:
 
     1. Code correctness: The logic may have flaws that prevent it from working as intended
     2. Problem coverage: The solution may not fully address all requirements or handle all cases
