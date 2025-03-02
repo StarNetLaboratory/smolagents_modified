@@ -1104,6 +1104,9 @@ Please revise your approach to address these issues. Provide an improved solutio
         critic_attempts = 0
         code_action = None
         
+        # Check if the final_answer tool is being used directly
+        is_direct_final_answer = False
+        
         while critic_attempts < self.max_critic_attempts:
             try:
                 if critic_attempts > 0:
@@ -1139,29 +1142,65 @@ Please revise your approach to address these issues. Provide an improved solutio
                 # Try to parse the code output
                 try:
                     code_action = fix_final_answer_code(parse_code_blobs(model_output))
+                    
+                    # Check if the code is directly calling final_answer with a critic response
+                    if "final_answer(" in code_action.lower() and "not accept:" in code_action.lower():
+                        self.logger.log(
+                            Panel(Text("Detected main agent attempting to return critic feedback directly. Forcing agent to revise.", style="red")),
+                            level=LogLevel.INFO,
+                        )
+                        
+                        # Force another iteration with explicit instructions
+                        is_direct_final_answer = True
+                        
+                        # Create a placeholder CriticStep to add to memory
+                        critic_step = CriticStep(start_time=time.time())
+                        critic_step.feedback = """NOT ACCEPT: You are returning the critic's feedback as your final answer instead of addressing the issues.
+                        
+You need to:
+1. Understand the feedback from the critic
+2. Revise your code to fix the identified issues
+3. Provide a new solution that addresses all concerns
+
+Do NOT return critic feedback as your answer. Fix the problems and submit an improved solution."""
+                        critic_step.accepted = False
+                        critic_step.end_time = time.time()
+                        critic_step.duration = critic_step.end_time - critic_step.start_time
+                        
+                        memory_step.critic_steps = memory_step.critic_steps or []
+                        memory_step.critic_steps.append(critic_step)
+                        
+                        critic_attempts += 1
+                        continue
+                        
                 except Exception as e:
                     error_msg = f"Error in code parsing:\n{e}\nMake sure to provide correct code blobs."
                     raise AgentParsingError(error_msg, self.logger)
                 
-                # Send the proposed code and reasoning to the critic
-                critic_step = self._critic_review(model_output, code_action)
-                memory_step.critic_steps = memory_step.critic_steps or []
-                memory_step.critic_steps.append(critic_step)
-                
-                # Check if the critic accepted the code
-                if critic_step.accepted:
-                    self.logger.log(
-                        Panel(Text(f"Critic accepted the code (attempt {critic_attempts + 1}). Proceeding with execution.", style="green")),
-                        level=LogLevel.INFO,
-                    )
-                    break
-                else:
-                    self.logger.log(
-                        Panel(Text(f"Critic rejected the code (attempt {critic_attempts + 1}/{self.max_critic_attempts}).\nFeedback: {critic_step.feedback}", style="yellow")),
-                        level=LogLevel.INFO,
-                    )
+                # Skip critic review if we already identified a direct final_answer issue
+                if not is_direct_final_answer:
+                    # Send the proposed code and reasoning to the critic
+                    critic_step = self._critic_review(model_output, code_action)
+                    memory_step.critic_steps = memory_step.critic_steps or []
+                    memory_step.critic_steps.append(critic_step)
                     
-                    critic_attempts += 1
+                    # Check if the critic accepted the code
+                    if critic_step.accepted:
+                        self.logger.log(
+                            Panel(Text(f"Critic accepted the code (attempt {critic_attempts + 1}). Proceeding with execution.", style="green")),
+                            level=LogLevel.INFO,
+                        )
+                        break
+                    else:
+                        self.logger.log(
+                            Panel(Text(f"Critic rejected the code (attempt {critic_attempts + 1}/{self.max_critic_attempts}).\nFeedback: {critic_step.feedback}", style="yellow")),
+                            level=LogLevel.INFO,
+                        )
+                
+                # Reset the direct final answer flag
+                is_direct_final_answer = False
+                critic_attempts += 1
+                
             except AgentGenerationError as e:
                 raise e
             
@@ -1259,7 +1298,7 @@ Please revise your approach to address these issues. Provide an improved solutio
         """
         critic_step = CriticStep(start_time=time.time())
         
-        critic_request = f"""Please review the following agent reasoning and proposed code:
+        critic_request = f"""Please analyze the following agent reasoning and proposed code thoroughly:
 
 AGENT REASONING AND CODE:
 {model_output}
@@ -1269,7 +1308,21 @@ PARSED CODE THAT WILL BE EXECUTED:
 {code_action}
 ```
 
-Provide your analysis and conclude with either ACCEPT or NOT ACCEPT."""
+Leverage your analytical capabilities to evaluate:
+1. Whether the reasoning is sound and fully addresses the problem
+2. If the code correctly implements the described approach
+3. Whether there are any bugs, edge cases, or logical errors
+4. If the solution is efficient and well-structured
+5. How well the solution meets the original requirements
+
+Provide a comprehensive analysis with specific details about strengths and weaknesses.
+If you find issues, explain exactly what they are and why they matter.
+
+Your response MUST end with either:
+- "ACCEPT: [Reason for acceptance with brief justification]" - if the code is correct and addresses the requirements
+- "NOT ACCEPT: [Specific, detailed explanation of issues to fix]" - if you found problems
+
+Be specific and actionable in your feedback. Do not use generic placeholders."""
         
         try:
             # We're now always using a critic agent
@@ -1282,9 +1335,59 @@ Provide your analysis and conclude with either ACCEPT or NOT ACCEPT."""
                 critic_feedback = str(critic_response)
                 
             critic_step.feedback = critic_feedback
+            
+            # Check if the critic gave insufficient feedback
+            if (critic_feedback.strip() == "NOT ACCEPT: [Detailed explanation of issues]" or
+                critic_feedback.strip() == "NOT ACCEPT:" or
+                (critic_feedback.lower().startswith("not accept:") and len(critic_feedback) < 30)):
+                
+                # If critic gave insufficient feedback, ask for detailed analysis
+                retry_request = f"""I need you to leverage your analytical capabilities to provide SPECIFIC details about what's wrong with this code and reasoning.
+
+AGENT REASONING AND CODE:
+{model_output}
+
+PARSED CODE THAT WILL BE EXECUTED:
+```python
+{code_action}
+```
+
+Your previous feedback was too generic. Please perform a deep analysis and:
+1. Identify specific issues in the code or reasoning
+2. Explain why each issue matters and how it affects the solution
+3. Suggest how these issues could be addressed
+
+End with "NOT ACCEPT: [Your detailed explanation]" with actual detailed analysis, not placeholders or generic feedback."""
+
+                # Retry with a more explicit request
+                retry_response = self.critic_agent.run(retry_request, reset=True)
+                
+                if hasattr(retry_response, 'content'):
+                    retry_feedback = retry_response.content
+                else:
+                    retry_feedback = str(retry_response)
+                
+                # Only update if we got a better response
+                if (retry_feedback.strip() != "NOT ACCEPT: [Detailed explanation of issues]" and 
+                    "NOT ACCEPT:" in retry_feedback and 
+                    len(retry_feedback) > 30):
+                    critic_step.feedback = retry_feedback
+                    critic_feedback = retry_feedback
+                else:
+                    # If still got a bad response, create a default feedback with specific focus areas
+                    default_feedback = """NOT ACCEPT: The proposed solution needs improvements in these specific areas:
+
+1. Code correctness: The logic may have flaws that prevent it from working as intended
+2. Problem coverage: The solution may not fully address all requirements or handle all cases
+3. Error handling: Edge cases might not be properly handled
+4. Implementation: There may be inefficiencies or structural issues in the approach
+
+Please reconsider your approach with these aspects in mind and provide an improved solution that addresses these concerns."""
+                    critic_step.feedback = default_feedback
+                    critic_feedback = default_feedback
                 
             # Determine if the critic accepted the code
-            lower_feedback = critic_step.feedback.lower()
+            lower_feedback = critic_feedback.lower()
             if "accept:" in lower_feedback and "not accept:" not in lower_feedback:
                 critic_step.accepted = True
             else:
@@ -1308,5 +1411,5 @@ Provide your analysis and conclude with either ACCEPT or NOT ACCEPT."""
         critic_step.duration = critic_step.end_time - critic_step.start_time
         
         return critic_step
-        
+
 __all__ = ["MultiStepAgent", "CodeAgent", "ToolCallingAgent", "AgentMemory", "CriticCodeAgent"]
