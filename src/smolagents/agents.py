@@ -1383,8 +1383,8 @@ Do NOT return critic feedback as your answer. Fix the problems and submit an imp
                     critic_step.feedback = retry_feedback
 
             else:
-            # Provide a structured fallback if the retry still fails
-            critic_feedback = """NOT SURE: The proposed solution may need improvements:
+                # Provide a structured fallback if the retry still fails
+                critic_feedback = """NOT SURE: The proposed solution may need improvements:
 
     1. Code correctness: The logic may have flaws that prevent it from working as intended
     2. Problem coverage: The solution may not fully address all requirements or handle all cases
