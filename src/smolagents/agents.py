@@ -1320,9 +1320,9 @@ Do NOT return critic feedback as your answer. Fix the problems and submit an imp
 
         Your response MUST end with one of the following:
 
-        "ACCEPT: [Reason for acceptance with brief justification]" - if the code is correct and addresses the requirements.
-        "NOT ACCEPT: [Specific, detailed explanation of issues to fix]" - if you found problems.
-        "NOT SURE: [Why you are unsure]" - if you could not provide feedback and the agent should proceed with caution.
+        "ACCEPT: Your brief justification" - if the code is correct and addresses the requirements.
+        "NOT ACCEPT: Your Ssecific, detailed explanation of issues to fix" - if you found problems.
+        "NOT SURE: Why you are unsure" - if you could not provide feedback and the agent should proceed with caution.
         Be specific and actionable in your feedback. Do not use generic placeholders."""
             
         try:
@@ -1347,27 +1347,28 @@ Do NOT return critic feedback as your answer. Fix the problems and submit an imp
                     critic_feedback.startswith("NOT SURE:")):
                 self.logger.log(
                     "Critic response did not conform to expected format. Requesting re-evaluation.",
-                    level=LogLevel.WARNING,
+                    level=LogLevel.INFO,
                 )
+
                 retry_request = f"""Your response did not follow the required format or lacked sufficient detail.
 
-        AGENT REASONING AND CODE:
-        {model_output}
+                    AGENT REASONING AND CODE:
+                    {model_output}
 
-        PARSED CODE THAT WILL BE EXECUTED:
-        ```python
-        {code_action}
-        ```
+                    PARSED CODE THAT WILL BE EXECUTED:
+                    ```python
+                    {code_action}
+                    ```
 
-        Provide a proper response ending with:
+                    Provide a proper response ending with:
 
-        "ACCEPT: [Your reasoning]" if the code is correct.
-        "NOT ACCEPT: [Specific, detailed explanation of issues]" if there are problems.
-        "NOT SURE: [Why you are unsure]" if you cannot assess this properly.
-        Do not use placeholders. Provide specific, actionable feedback."""
-
-            retry_response = self.critic_agent.run(retry_request, reset=True)
-
+                    "ACCEPT: [Your reasoning]" if the code is correct.
+                    "NOT ACCEPT: [Specific, detailed explanation of issues]" if there are problems.
+                    "NOT SURE: [Why you are unsure]" if you cannot assess this properly.
+                    Do not use placeholders. Provide specific, actionable feedback."""
+                
+                retry_response = self.critic_agent.run(retry_request, reset=True)
+                print(f'{retry_response=}')
             if hasattr(retry_response, 'content'):
                 if isinstance(retry_response.content, list):
                     retry_feedback = " ".join(map(str, retry_response.content)).strip()  # Convert list to string
