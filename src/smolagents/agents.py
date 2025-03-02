@@ -1285,20 +1285,21 @@ Do NOT return critic feedback as your answer. Fix the problems and submit an imp
         memory_step.action_output = output
         return output if is_final_answer else None
         
-    def _critic_review(self, model_output: str, code_action: str) -> CriticStep:
-        """
-        Send the proposed code and reasoning to the critic for review.
-        
-        Args:
-            model_output (str): The full output from the main agent, including reasoning
-            code_action (str): The parsed code that would be executed
-            
-        Returns:
-            CriticStep: A structure containing the critic's review, feedback and acceptance decision
-        """
-        critic_step = CriticStep(start_time=time.time())
-        
-        critic_request = f"""Please analyze the following agent reasoning and proposed code thoroughly:
+
+def _critic_review(self, model_output: str, code_action: str) -> CriticStep:
+    """
+    Send the proposed code and reasoning to the critic for review.
+
+    Args:
+        model_output (str): The full output from the main agent, including reasoning
+        code_action (str): The parsed code that would be executed
+
+    Returns:
+        CriticStep: A structure containing the critic's review, feedback, and acceptance decision
+    """
+    critic_step = CriticStep(start_time=time.time())
+
+    critic_request = f"""Please analyze the following agent reasoning and proposed code thoroughly:
 
 AGENT REASONING AND CODE:
 {model_output}
@@ -1309,40 +1310,42 @@ PARSED CODE THAT WILL BE EXECUTED:
 ```
 
 Leverage your analytical capabilities to evaluate:
-1. Whether the reasoning is sound and fully addresses the problem
-2. If the code correctly implements the described approach
-3. Whether there are any bugs, edge cases, or logical errors
-4. If the solution is efficient and well-structured
-5. How well the solution meets the original requirements
 
-Provide a comprehensive analysis with specific details about strengths and weaknesses.
-If you find issues, explain exactly what they are and why they matter.
+Whether the reasoning is sound and fully addresses the problem.
+If the code correctly implements the described approach.
+Whether there are any bugs, edge cases, or logical errors.
+If the solution is efficient and well-structured.
+How well the solution meets the original requirements.
+Provide a comprehensive analysis with specific details about strengths and weaknesses. If you find issues, explain exactly what they are and why they matter.
 
-Your response MUST end with either:
-- "ACCEPT: [Reason for acceptance with brief justification]" - if the code is correct and addresses the requirements
-- "NOT ACCEPT: [Specific, detailed explanation of issues to fix]" - if you found problems
+Your response MUST end with one of the following:
 
+"ACCEPT: [Reason for acceptance with brief justification]" - if the code is correct and addresses the requirements.
+"NOT ACCEPT: [Specific, detailed explanation of issues to fix]" - if you found problems.
+"NOT SURE: [Why you are unsure]" - if you could not provide feedback and the agent should proceed with caution.
 Be specific and actionable in your feedback. Do not use generic placeholders."""
         
-        try:
-            # We're now always using a critic agent
-            critic_response = self.critic_agent.run(critic_request, reset=True)
-            critic_step.model_output_message = critic_response
-            
-            if hasattr(critic_response, 'content'):
-                critic_feedback = critic_response.content
-            else:
-                critic_feedback = str(critic_response)
-                
-            critic_step.feedback = critic_feedback
-            
-            # Check if the critic gave insufficient feedback
-            if (critic_feedback.strip() == "NOT ACCEPT: [Detailed explanation of issues]" or
-                critic_feedback.strip() == "NOT ACCEPT:" or
-                (critic_feedback.lower().startswith("not accept:") and len(critic_feedback) < 30)):
-                
-                # If critic gave insufficient feedback, ask for detailed analysis
-                retry_request = f"""I need you to leverage your analytical capabilities to provide SPECIFIC details about what's wrong with this code and reasoning.
+    try:
+        # Invoke the critic agent
+        critic_response = self.critic_agent.run(critic_request, reset=True)
+        critic_step.model_output_message = critic_response
+
+        if hasattr(critic_response, 'content'):
+            critic_feedback = critic_response.content.strip()
+        else:
+            critic_feedback = str(critic_response).strip()
+
+        critic_step.feedback = critic_feedback
+
+        # Ensure feedback ends with an expected format
+        if not (critic_feedback.startswith("ACCEPT:") or 
+                critic_feedback.startswith("NOT ACCEPT:") or 
+                critic_feedback.startswith("NOT SURE:")):
+            self.logger.log(
+                "Critic response did not conform to expected format. Requesting re-evaluation.",
+                level=LogLevel.WARNING,
+            )
+            retry_request = f"""Your response did not follow the required format or lacked sufficient detail.
 
 AGENT REASONING AND CODE:
 {model_output}
@@ -1352,64 +1355,63 @@ PARSED CODE THAT WILL BE EXECUTED:
 {code_action}
 ```
 
-Your previous feedback was too generic. Please perform a deep analysis and:
-1. Identify specific issues in the code or reasoning
-2. Explain why each issue matters and how it affects the solution
-3. Suggest how these issues could be addressed
+Provide a proper response ending with:
 
-End with "NOT ACCEPT: [Your detailed explanation]" with actual detailed analysis, not placeholders or generic feedback."""
+"ACCEPT: [Your reasoning]" if the code is correct.
+"NOT ACCEPT: [Specific, detailed explanation of issues]" if there are problems.
+"NOT SURE: [Why you are unsure]" if you cannot assess this properly.
+Do not use placeholders. Provide specific, actionable feedback."""
 
-                # Retry with a more explicit request
-                retry_response = self.critic_agent.run(retry_request, reset=True)
-                
-                if hasattr(retry_response, 'content'):
-                    retry_feedback = retry_response.content
-                else:
-                    retry_feedback = str(retry_response)
-                
-                # Only update if we got a better response
-                if (retry_feedback.strip() != "NOT ACCEPT: [Detailed explanation of issues]" and 
-                    "NOT ACCEPT:" in retry_feedback and 
-                    len(retry_feedback) > 30):
-                    critic_step.feedback = retry_feedback
-                    critic_feedback = retry_feedback
-                else:
-                    # If still got a bad response, create a default feedback with specific focus areas
-                    default_feedback = """NOT ACCEPT: The proposed solution needs improvements in these specific areas:
+        retry_response = self.critic_agent.run(retry_request, reset=True)
+        retry_feedback = retry_response.content.strip() if hasattr(retry_response, 'content') else str(retry_response).strip()
+
+        # Use retry response if it is properly formatted
+        if retry_feedback.startswith(("ACCEPT:", "NOT ACCEPT:", "NOT SURE:")):
+            critic_feedback = retry_feedback
+            critic_step.feedback = retry_feedback
+        else:
+            # Provide a structured fallback if the retry still fails
+            critic_feedback = """NOT SURE: The proposed solution may need improvements:
 
 1. Code correctness: The logic may have flaws that prevent it from working as intended
 2. Problem coverage: The solution may not fully address all requirements or handle all cases
 3. Error handling: Edge cases might not be properly handled
 4. Implementation: There may be inefficiencies or structural issues in the approach
 
-Please reconsider your approach with these aspects in mind and provide an improved solution that addresses these concerns."""
-                    critic_step.feedback = default_feedback
-                    critic_feedback = default_feedback
+Please refine the solution considering these factors and re-evaluate."""
+                    # critic_step.feedback = default_feedback
+                    # critic_feedback = default_feedback
+                    critic_step.feedback = critic_feedback
                 
-            # Determine if the critic accepted the code
-            lower_feedback = critic_feedback.lower()
-            if "accept:" in lower_feedback and "not accept:" not in lower_feedback:
-                critic_step.accepted = True
-            else:
-                critic_step.accepted = False
-                
-            self.logger.log_markdown(
-                content=critic_step.feedback,
-                title="Critic Review:",
-                level=LogLevel.DEBUG,
-            )
-            
-        except Exception as e:
-            critic_step.feedback = f"Error in critic review: {str(e)}"
-            critic_step.accepted = True  # Default to accepting on critic error
-            self.logger.log(
-                f"Error in critic review: {str(e)}. Defaulting to accepting the code.",
-                level=LogLevel.WARNING,
-            )
-            
-        critic_step.end_time = time.time()
-        critic_step.duration = critic_step.end_time - critic_step.start_time
-        
-        return critic_step
+        # Determine acceptance based on final feedback
+        lower_feedback = critic_feedback.lower()
+        if lower_feedback.startswith("accept:"):
+            critic_step.accepted = True
+        elif lower_feedback.startswith("not sure:"):
+            critic_step.accepted = True  # Signal that the agent should proceed cautiously
+            self.logger.log("Critic was unsure about the correctness of the solution. Proceed with caution.", level=LogLevel.INFO)
+        else:
+            critic_step.accepted = False  # Default to rejection if unsure
+
+        # Log final critic feedback
+        self.logger.log_markdown(
+            content=critic_step.feedback,
+            title="Critic Review:",
+            level=LogLevel.DEBUG,
+        )
+
+    except Exception as e:
+        critic_step.feedback = f"Error in critic review: {str(e)}"
+        critic_step.accepted = True  # Default to accepting on critic error
+        self.logger.log(
+            f"Error in critic review: {str(e)}. Defaulting to accepting the code.",
+            level=LogLevel.INFO,
+        )
+
+    critic_step.end_time = time.time()
+    critic_step.duration = critic_step.end_time - critic_step.start_time
+
+    return critic_step
+
 
 __all__ = ["MultiStepAgent", "CodeAgent", "ToolCallingAgent", "AgentMemory", "CriticCodeAgent"]
