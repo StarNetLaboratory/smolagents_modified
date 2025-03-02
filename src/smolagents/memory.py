@@ -1,7 +1,7 @@
 from dataclasses import asdict, dataclass
 from logging import getLogger
-from typing import TYPE_CHECKING, Any, Dict, List, TypedDict, Union
-
+from typing import TYPE_CHECKING, Any, Dict, List, TypedDict, Union, Optional
+import time
 from smolagents.models import ChatMessage, MessageRole
 from smolagents.monitoring import AgentLogger
 from smolagents.utils import AgentError, make_json_serializable
