@@ -1301,29 +1301,29 @@ Do NOT return critic feedback as your answer. Fix the problems and submit an imp
 
         critic_request = f"""Please analyze the following agent reasoning and proposed code thoroughly:
 
-    AGENT REASONING AND CODE:
-    {model_output}
+        AGENT REASONING AND CODE:
+        {model_output}
 
-    PARSED CODE THAT WILL BE EXECUTED:
-    ```python
-    {code_action}
-    ```
+        PARSED CODE THAT WILL BE EXECUTED:
+        ```python
+        {code_action}
+        ```
 
-    Leverage your analytical capabilities to evaluate:
+        Leverage your analytical capabilities to evaluate:
 
-    Whether the reasoning is sound and fully addresses the problem.
-    If the code correctly implements the described approach.
-    Whether there are any bugs, edge cases, or logical errors.
-    If the solution is efficient and well-structured.
-    How well the solution meets the original requirements.
-    Provide a comprehensive analysis with specific details about strengths and weaknesses. If you find issues, explain exactly what they are and why they matter.
+        Whether the reasoning is sound and fully addresses the problem.
+        If the code correctly implements the described approach.
+        Whether there are any bugs, edge cases, or logical errors.
+        If the solution is efficient and well-structured.
+        How well the solution meets the original requirements.
+        Provide a comprehensive analysis with specific details about strengths and weaknesses. If you find issues, explain exactly what they are and why they matter.
 
-    Your response MUST end with one of the following:
+        Your response MUST end with one of the following:
 
-    "ACCEPT: [Reason for acceptance with brief justification]" - if the code is correct and addresses the requirements.
-    "NOT ACCEPT: [Specific, detailed explanation of issues to fix]" - if you found problems.
-    "NOT SURE: [Why you are unsure]" - if you could not provide feedback and the agent should proceed with caution.
-    Be specific and actionable in your feedback. Do not use generic placeholders."""
+        "ACCEPT: [Reason for acceptance with brief justification]" - if the code is correct and addresses the requirements.
+        "NOT ACCEPT: [Specific, detailed explanation of issues to fix]" - if you found problems.
+        "NOT SURE: [Why you are unsure]" - if you could not provide feedback and the agent should proceed with caution.
+        Be specific and actionable in your feedback. Do not use generic placeholders."""
             
         try:
             # Invoke the critic agent
@@ -1351,23 +1351,22 @@ Do NOT return critic feedback as your answer. Fix the problems and submit an imp
                 )
                 retry_request = f"""Your response did not follow the required format or lacked sufficient detail.
 
-    AGENT REASONING AND CODE:
-    {model_output}
+        AGENT REASONING AND CODE:
+        {model_output}
 
-    PARSED CODE THAT WILL BE EXECUTED:
-    ```python
-    {code_action}
-    ```
+        PARSED CODE THAT WILL BE EXECUTED:
+        ```python
+        {code_action}
+        ```
 
-    Provide a proper response ending with:
+        Provide a proper response ending with:
 
-    "ACCEPT: [Your reasoning]" if the code is correct.
-    "NOT ACCEPT: [Specific, detailed explanation of issues]" if there are problems.
-    "NOT SURE: [Why you are unsure]" if you cannot assess this properly.
-    Do not use placeholders. Provide specific, actionable feedback."""
+        "ACCEPT: [Your reasoning]" if the code is correct.
+        "NOT ACCEPT: [Specific, detailed explanation of issues]" if there are problems.
+        "NOT SURE: [Why you are unsure]" if you cannot assess this properly.
+        Do not use placeholders. Provide specific, actionable feedback."""
 
             retry_response = self.critic_agent.run(retry_request, reset=True)
-            retry_feedback = retry_response.content.strip() if hasattr(retry_response, 'content') else str(retry_response).strip()
 
             if hasattr(retry_response, 'content'):
                 if isinstance(retry_response.content, list):
@@ -1381,6 +1380,7 @@ Do NOT return critic feedback as your answer. Fix the problems and submit an imp
             if retry_feedback.startswith(("ACCEPT:", "NOT ACCEPT:", "NOT SURE:")):
                 critic_feedback = retry_feedback
                 critic_step.feedback = retry_feedback
+
             else:
                 # Provide a structured fallback if the retry still fails
                 critic_feedback = """NOT SURE: The proposed solution may need improvements:
@@ -1393,14 +1393,14 @@ Do NOT return critic feedback as your answer. Fix the problems and submit an imp
     Please refine the solution considering these factors and re-evaluate."""
                         # critic_step.feedback = default_feedback
                         # critic_feedback = default_feedback
-                critic_step.feedback = critic_feedback
-                    
+                    critic_step.feedback = critic_feedback
+
             # Determine acceptance based on final feedback
             lower_feedback = critic_feedback.lower()
             if lower_feedback.startswith("accept:"):
                 critic_step.accepted = True
             elif lower_feedback.startswith("not sure:"):
-                critic_step.accepted = True  # Signal that the agent should proceed cautiously
+                critic_step.accepted = False  # Signal that the agent should proceed cautiously
                 self.logger.log("Critic was unsure about the correctness of the solution. Proceed with caution.", level=LogLevel.INFO)
             else:
                 critic_step.accepted = False  # Default to rejection if unsure
