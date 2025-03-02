@@ -1240,7 +1240,7 @@ Provide your analysis and conclude with either ACCEPT or NOT ACCEPT."""
             critic_step.accepted = True  # Default to accepting on critic error
             self.logger.log(
                 f"Error in critic review: {str(e)}. Defaulting to accepting the code.",
-                level=LogLevel.WARNING,
+                level=LogLevel.INFO,
             )
             
         critic_step.end_time = time.time()
