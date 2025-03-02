@@ -1330,8 +1330,12 @@ Do NOT return critic feedback as your answer. Fix the problems and submit an imp
             critic_response = self.critic_agent.run(critic_request, reset=True)
             critic_step.model_output_message = critic_response
 
+
             if hasattr(critic_response, 'content'):
-                critic_feedback = critic_response.content.strip()
+                if isinstance(critic_response.content, list):
+                    critic_feedback = " ".join(map(str, critic_response.content)).strip()  # Convert list to string
+                else:
+                    critic_feedback = str(critic_response.content).strip()
             else:
                 critic_feedback = str(critic_response).strip()
 
@@ -1364,6 +1368,14 @@ Do NOT return critic feedback as your answer. Fix the problems and submit an imp
 
             retry_response = self.critic_agent.run(retry_request, reset=True)
             retry_feedback = retry_response.content.strip() if hasattr(retry_response, 'content') else str(retry_response).strip()
+
+            if hasattr(retry_response, 'content'):
+                if isinstance(retry_response.content, list):
+                    retry_feedback = " ".join(map(str, retry_response.content)).strip()  # Convert list to string
+                else:
+                    retry_feedback = str(retry_response.content).strip()
+            else:
+                retry_feedback = str(retry_response).strip()
 
             # Use retry response if it is properly formatted
             if retry_feedback.startswith(("ACCEPT:", "NOT ACCEPT:", "NOT SURE:")):
