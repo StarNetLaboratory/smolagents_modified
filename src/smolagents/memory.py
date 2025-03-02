@@ -231,4 +231,112 @@ class AgentMemory:
                 logger.log_markdown(title="Agent output:", content=step.facts + "\n" + step.plan)
 
 
-__all__ = ["AgentMemory"]
+class CriticStep(MemoryStep):
+    """
+    Memory step for the critic's review of code and reasoning.
+    
+    Attributes:
+        start_time (float): Time when the critic review started.
+        end_time (float): Time when the critic review ended.
+        duration (float): Duration of the critic review.
+        model_input_messages (List[Dict]): Messages sent to the critic model.
+        model_output_message (Dict): Response from the critic model.
+        feedback (str): Feedback from the critic.
+        accepted (bool): Whether the critic accepted the code or not.
+    """
+    
+    def __init__(
+        self,
+        start_time: Optional[float] = None,
+        end_time: Optional[float] = None,
+        duration: Optional[float] = None,
+        model_input_messages: Optional[List[Dict]] = None,
+        model_output_message: Optional[Dict] = None,
+        feedback: str = "",
+        accepted: bool = False,
+    ):
+        super().__init__()
+        self.start_time = start_time if start_time is not None else time.time()
+        self.end_time = end_time
+        self.duration = duration
+        self.model_input_messages = model_input_messages if model_input_messages is not None else []
+        self.model_output_message = model_output_message
+        self.feedback = feedback
+        self.accepted = accepted
+        
+    def to_messages(self, summary_mode: bool = False) -> List[Dict]:
+        """
+        Converts the critic step to a list of messages that can be sent to a model.
+        
+        Args:
+            summary_mode (bool): Whether to return a summarized version of the messages.
+            
+        Returns:
+            List[Dict]: List of messages representing this critic step.
+        """
+        if summary_mode:
+            status = "ACCEPTED" if self.accepted else "REJECTED"
+            return [
+                {
+                    "role": "assistant",
+                    "content": f"[Critic {status}] {self.feedback[:200] + '...' if len(self.feedback) > 200 else self.feedback}",
+                }
+            ]
+        
+        messages = []
+        if self.model_output_message:
+            messages.append({
+                "role": "assistant",
+                "content": f"[Critic Review] {self.feedback}",
+            })
+        
+        return messages
+        
+    def __str__(self) -> str:
+        """String representation of the critic step."""
+        status = "ACCEPTED" if self.accepted else "REJECTED"
+        return f"CriticStep(status={status}, feedback={self.feedback[:50] + '...' if len(self.feedback) > 50 else self.feedback})"
+
+__all__ = ["CriticStep"]
+
+# Extend ActionStep to include a list of critic steps
+def patch_action_step():
+    """
+    Patch the ActionStep class to include a list of critic steps.
+    This is done to avoid modifying the original class.
+    """
+    from smolagents.memory import ActionStep
+    
+    # Add critic_steps attribute to ActionStep
+    original_init = ActionStep.__init__
+    
+    def __init_with_critic_steps(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        if not hasattr(self, "critic_steps"):
+            self.critic_steps = []
+    
+    ActionStep.__init__ = __init_with_critic_steps
+    
+    # Update the to_messages method to include critic steps
+    original_to_messages = ActionStep.to_messages
+    
+    def to_messages_with_critic_steps(self, summary_mode=False):
+        messages = original_to_messages(self, summary_mode)
+        
+        # Insert critic steps if they exist
+        if hasattr(self, "critic_steps") and self.critic_steps:
+            for critic_step in self.critic_steps:
+                critic_messages = critic_step.to_messages(summary_mode)
+                messages.extend(critic_messages)
+                
+        return messages
+    
+    ActionStep.to_messages = to_messages_with_critic_steps
+    
+    return ActionStep
+
+
+# Apply the patch when this module is imported
+patched_action_step = patch_action_step()
+
+__all__ = ["AgentMemory", "CriticStep"]
