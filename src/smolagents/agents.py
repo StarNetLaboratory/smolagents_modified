@@ -1429,20 +1429,18 @@ Do NOT return critic feedback as your answer. Fix the problems and submit an imp
                     critic_feedback = retry_feedback
                     critic_step.feedback = retry_feedback
 
-            else:
-                # Provide a structured fallback if the retry still fails
-                print('critic_feedback changed to not sure') ### debug
-                critic_feedback = """NOT SURE: The proposed solution may need improvements:
+                else:
+                    # Provide a structured fallback if the retry still fails
+                    print('critic_feedback changed to not sure') ### debug
+                    critic_feedback = """NOT SURE: The proposed solution may need improvements:
 
-    1. Code correctness: The logic may have flaws that prevent it from working as intended
-    2. Problem coverage: The solution may not fully address all requirements or handle all cases
-    3. Error handling: Edge cases might not be properly handled
-    4. Implementation: There may be inefficiencies or structural issues in the approach
+        1. Code correctness: The logic may have flaws that prevent it from working as intended
+        2. Problem coverage: The solution may not fully address all requirements or handle all cases
+        3. Error handling: Edge cases might not be properly handled
+        4. Implementation: There may be inefficiencies or structural issues in the approach
 
-    Please refine the solution considering these factors and re-evaluate."""
-                        # critic_step.feedback = default_feedback
-                        # critic_feedback = default_feedback
-                critic_step.feedback = critic_feedback
+        Please refine the solution considering these factors and re-evaluate."""
+                    critic_step.feedback = critic_feedback
 
             # Determine acceptance based on final feedback
             lower_feedback = critic_feedback.lower()
