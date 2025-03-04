@@ -324,6 +324,75 @@ class MultiStepAgent:
         except Exception as e:
             return f"Error in generating final LLM output:\n{e}"
 
+    # Add this method to the CriticCodeAgent class
+
+    def _run(self, task: str, images: List[str] | None = None) -> Generator[ActionStep | AgentType, None, None]:
+        """
+        Run the agent in streaming mode and returns a generator of all the steps.
+
+        Args:
+            task (`str`): Task to perform.
+            images (`list[str]`): Paths to image(s).
+        """
+        final_answer = None
+        self.step_number = 1
+        
+        # Get the agent name to use in logs
+        agent_name = self.name if hasattr(self, 'name') and self.name else self.agent_name
+        
+        while final_answer is None and self.step_number <= self.max_steps:
+            step_start_time = time.time()
+            memory_step = ActionStep(
+                step_number=self.step_number,
+                start_time=step_start_time,
+                observations_images=images,
+            )
+            try:
+                if self.planning_interval is not None and self.step_number % self.planning_interval == 1:
+                    self.planning_step(
+                        task,
+                        is_first_step=(self.step_number == 1),
+                        step=self.step_number,
+                    )
+                self.logger.log_rule(f"Step {self.step_number}", level=LogLevel.INFO, agent_name=agent_name)
+
+                # Run one step!
+                final_answer = self.step(memory_step)
+            except AgentError as e:
+                memory_step.error = e
+            finally:
+                memory_step.end_time = time.time()
+                memory_step.duration = memory_step.end_time - step_start_time
+                self.memory.steps.append(memory_step)
+                for callback in self.step_callbacks:
+                    # For compatibility with old callbacks that don't take the agent as an argument
+                    if len(inspect.signature(callback).parameters) == 1:
+                        callback(memory_step)
+                    else:
+                        callback(memory_step, agent=self)
+                self.step_number += 1
+                yield memory_step
+
+        if final_answer is None and self.step_number == self.max_steps + 1:
+            error_message = "Reached max steps."
+            final_answer = self.provide_final_answer(task, images)
+            final_memory_step = ActionStep(
+                step_number=self.step_number, error=AgentMaxStepsError(error_message, self.logger)
+            )
+            final_memory_step.action_output = final_answer
+            final_memory_step.end_time = time.time()
+            final_memory_step.duration = memory_step.end_time - step_start_time
+            self.memory.steps.append(final_memory_step)
+            for callback in self.step_callbacks:
+                # For compatibility with old callbacks that don't take the agent as an argument
+                if len(inspect.signature(callback).parameters) == 1:
+                    callback(final_memory_step)
+                else:
+                    callback(final_memory_step, agent=self)
+            yield final_memory_step
+
+        yield handle_agent_output_types(final_answer)
+
     def execute_tool_call(self, tool_name: str, arguments: Union[Dict[str, str], str]) -> Any:
         """
         Execute tool with the provided input and returns the result.
@@ -766,13 +835,13 @@ class CodeAgent(MultiStepAgent):
         planning_interval: Optional[int] = None,
         use_e2b_executor: bool = False,
         max_print_outputs_length: Optional[int] = None,
-        permission: bool = True,  # ✅ Add permission flag (default: True)
+        permission: bool = True,  # Add permission flag (default: True)
         **kwargs,
     ):
         if system_prompt is None:
             system_prompt = CODE_SYSTEM_PROMPT
 
-        self.permission = permission  # ✅ Store permission flag
+        self.permission = permission  # Store permission flag
         self.additional_authorized_imports = additional_authorized_imports if additional_authorized_imports else []
         self.authorized_imports = list(set(BASE_BUILTIN_MODULES) | set(self.additional_authorized_imports))
 
