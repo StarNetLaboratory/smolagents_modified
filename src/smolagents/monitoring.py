@@ -26,6 +26,7 @@ from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
 from rich.tree import Tree
+from rich.markdown import Markdown
 
 
 class Monitor:
