@@ -297,10 +297,10 @@ class AgentLogger:
             subtitle = f"Agent: {agent_name}"
         
         panel = Panel(
-            Text(content, style="green"),
+            Text(content, style="black"),
             title="Task",
             subtitle=subtitle,
-            border_style="green",
+            border_style="black",
         )
         self.console.print(panel)
 
@@ -317,7 +317,7 @@ class AgentLogger:
         
         # Add agent name to the rule title if provided
         if agent_name:
-            title = f"[bold blue]Agent: {agent_name}[/bold blue] - {title}"
+            title = f"{agent_name} Thoughts - {title}"
         
         self.console.print(Rule(title))
 

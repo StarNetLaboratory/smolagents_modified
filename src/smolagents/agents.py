@@ -324,7 +324,6 @@ class MultiStepAgent:
         except Exception as e:
             return f"Error in generating final LLM output:\n{e}"
 
-    # Add this method to the CriticCodeAgent class
 
     def _run(self, task: str, images: List[str] | None = None) -> Generator[ActionStep | AgentType, None, None]:
         """
@@ -1093,7 +1092,7 @@ Your feedback will be used to improve the code before execution."""
             self.critic_agent = ToolCallingAgent(
                 tools=[],  # No tools needed for critique
                 model=critic_model_to_use,
-                verbosity_level=self.logger.level,  # Match main agent's verbosity
+                verbosity_level='DETAILED',  # Match main agent's verbosity
                 system_prompt=critic_system_prompt,
                 name="CriticAgent",
                 description="Reviews code and reasoning without executing it. Provides ACCEPT or NOT ACCEPT decisions.",
