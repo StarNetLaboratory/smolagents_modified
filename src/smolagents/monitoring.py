@@ -65,7 +65,7 @@ class Monitor:
                 f"| Input tokens: {self.total_input_token_count:,} | Output tokens: {self.total_output_token_count:,}"
             )
         console_outputs += "]"
-        self.logger.log(Text(console_outputs, style="dim"), level=1)
+        self.logger.log(Text(console_outputs, style="dim"), level=LogLevel.INFO)
 
 
 class LogLevel(IntEnum):
@@ -77,21 +77,7 @@ class LogLevel(IntEnum):
 YELLOW_HEX = "#d4b702"
 
 
-class AgentLogger:
-    def __init__(self, level: LogLevel = LogLevel.INFO):
-        self.level = level
-        self.console = Console()
 
-    def log(self, *args, level: str | LogLevel = LogLevel.INFO, **kwargs) -> None:
-        """Logs a message to the console.
-
-        Args:
-            level (LogLevel, optional): Defaults to LogLevel.INFO.
-        """
-        if isinstance(level, str):
-            level = LogLevel[level.upper()]
-        if level <= self.level:
-            self.console.print(*args, **kwargs)
 
     # def log_markdown(self, content: str, title: Optional[str] = None, level=LogLevel.INFO, style=YELLOW_HEX) -> None:
     #     markdown_content = Syntax(
@@ -152,6 +138,22 @@ class AgentLogger:
     #         ),
     #         level=level,
     #     )
+
+class AgentLogger:
+    def __init__(self, level: LogLevel = LogLevel.INFO):
+        self.level = level
+        self.console = Console()
+
+    def log(self, *args, level: str | LogLevel = LogLevel.INFO, **kwargs) -> None:
+        """Logs a message to the console.
+
+        Args:
+            level (LogLevel, optional): Defaults to LogLevel.INFO.
+        """
+        if isinstance(level, str):
+            level = LogLevel[level.upper()]
+        if level <= self.level:
+            self.console.print(*args, **kwargs)
 
     def log_messages(self, messages: List) -> None:
         messages_as_string = "\n".join([json.dumps(dict(message), indent=4) for message in messages])
