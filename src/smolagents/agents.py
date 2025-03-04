@@ -155,7 +155,7 @@ class MultiStepAgent:
         max_steps: int = 6,
         tool_parser: Optional[Callable] = None,
         add_base_tools: bool = False,
-        verbosity_level: int = 1,
+        verbosity_level: int = 2,
         grammar: Optional[Dict[str, str]] = None,
         managed_agents: Optional[List] = None,
         step_callbacks: Optional[List[Callable]] = None,
@@ -1249,25 +1249,38 @@ Do NOT return critic feedback as your answer. Fix the problems and submit an imp
 
         # If permission flag is enabled, ask for user permission
         if self.permission:
-            print("\n🚨 **Agent wants to execute the following code:**\n")
-            print(f"```python\n{code_action}\n```")
+            self.logger.log(
+                Panel(Text(f"Main Agent wants to execute the following code:\n```python\n{code_action}\n```.", style="red")),
+                level=LogLevel.INFO,
+            )
             
             # Show critic acceptance status
             if memory_step.critic_steps and memory_step.critic_steps[-1].accepted:
-                print("\n✅ The critic has ACCEPTED this code.")
+                self.logger.log(
+                    Panel(Text(f"The critic has ACCEPTED this code.", style="black")),
+                    level=LogLevel.INFO,
+                )
             else:
-                print("\n⚠️ The critic did NOT ACCEPT this code after multiple attempts.")
+                self.logger.log(
+                    Panel(Text(f"The critic did NOT ACCEPT this code after multiple attempts.", style="red")),
+                    level=LogLevel.INFO,
+                )           
                 
             response = input("\nPress Enter to execute, or type 'no' to abort: ").strip().lower()
-            if response == "no":
-                print("🚫 Execution aborted by the user. Exiting program.")
+            if response == "no" or response == 'n':
+                self.logger.log(
+                    Panel(Text(f"🚫 User aborted execution. Exiting program.", style="black")),
+                    level=LogLevel.INFO,
+                )                  
                 import sys
                 sys.exit(1)
             else:
-                print("✅ Proceeding with execution.")
-
+                self.logger.log(
+                    Panel(Text(f"✅ User accepted execution", style="black")),
+                    level=LogLevel.INFO,
+                )   
         # Execute the code
-        self.logger.log_code(title="Executing parsed code:", content=code_action, level=LogLevel.INFO)
+        # self.logger.log_code(title="Executing parsed code:", content=code_action, level=LogLevel.INFO) #redundant for user to see
         is_final_answer = False
         
         try:
@@ -1310,7 +1323,11 @@ Do NOT return critic feedback as your answer. Fix the problems and submit an imp
                 style=(f"bold {YELLOW_HEX}" if is_final_answer else ""),
             ),
         ]
-        self.logger.log(Group(*execution_outputs_console), level=LogLevel.INFO)
+        # self.logger.log(Group(*execution_outputs_console), level=LogLevel.INFO)
+        self.logger.log(
+            Panel(Text(Group(*execution_outputs_console), style="bold {YELLOW_HEX}")),
+            level=LogLevel.INFO,
+            )   
         memory_step.action_output = output
         return output if is_final_answer else None
         
@@ -1371,6 +1388,7 @@ Do NOT return critic feedback as your answer. Fix the problems and submit an imp
             critic_step.feedback = critic_feedback
 
             # Ensure feedback ends with an expected format
+            print(f'{critic_feedback.startswith}=') ##### Debug 
             if not (critic_feedback.startswith("ACCEPT:") or 
                     critic_feedback.startswith("NOT ACCEPT:") or 
                     critic_feedback.startswith("NOT SURE:")):
@@ -1413,6 +1431,7 @@ Do NOT return critic feedback as your answer. Fix the problems and submit an imp
 
             else:
                 # Provide a structured fallback if the retry still fails
+                print('critic_feedback changed to not sure') ### debug
                 critic_feedback = """NOT SURE: The proposed solution may need improvements:
 
     1. Code correctness: The logic may have flaws that prevent it from working as intended
@@ -1429,11 +1448,12 @@ Do NOT return critic feedback as your answer. Fix the problems and submit an imp
             lower_feedback = critic_feedback.lower()
             if lower_feedback.startswith("accept:"):
                 critic_step.accepted = True
-            elif lower_feedback.startswith("not sure:"):
-                critic_step.accepted = False  # Signal that the agent should proceed cautiously
-                self.logger.log("Critic was unsure about the correctness of the solution. Proceed with caution.", level=LogLevel.INFO)
+            elif lower_feedback.startswith("not accept:"):
+                critic_step.accepted = False  
             else:
                 critic_step.accepted = False  # Default to rejection if unsure
+                # self.logger.log("Critic was unsure about the correctness of the solution. Proceed with caution.", level=LogLevel.INFO)
+
 
             # Log final critic feedback
             self.logger.log_markdown(
@@ -1444,9 +1464,10 @@ Do NOT return critic feedback as your answer. Fix the problems and submit an imp
 
         except Exception as e:
             critic_step.feedback = f"Error in critic review: {str(e)}"
-            critic_step.accepted = True  # Default to accepting on critic error
+            critic_step.accepted = False  # Default to not accepting code
             self.logger.log(
-                f"Error in critic review: {str(e)}. Defaulting to accepting the code.",
+
+                f"Error in critic review: {str(e)}. Defaulting to NOT accepting the code.",
                 level=LogLevel.INFO,
             )
 
