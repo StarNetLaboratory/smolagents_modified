@@ -93,65 +93,65 @@ class AgentLogger:
         if level <= self.level:
             self.console.print(*args, **kwargs)
 
-    def log_markdown(self, content: str, title: Optional[str] = None, level=LogLevel.INFO, style=YELLOW_HEX) -> None:
-        markdown_content = Syntax(
-            content,
-            lexer="markdown",
-            theme="github-dark",
-            word_wrap=True,
-        )
-        if title:
-            self.log(
-                Group(
-                    Rule(
-                        "[bold italic]" + title,
-                        align="left",
-                        style=style,
-                    ),
-                    markdown_content,
-                ),
-                level=level,
-            )
-        else:
-            self.log(markdown_content, level=level)
+    # def log_markdown(self, content: str, title: Optional[str] = None, level=LogLevel.INFO, style=YELLOW_HEX) -> None:
+    #     markdown_content = Syntax(
+    #         content,
+    #         lexer="markdown",
+    #         # theme="github-dark",
+    #         word_wrap=True,
+    #     )
+    #     if title:
+    #         self.log(
+    #             Group(
+    #                 Rule(
+    #                     "[bold italic]" + title,
+    #                     align="left",
+    #                     style=style,
+    #                 ),
+    #                 markdown_content,
+    #             ),
+    #             level=level,
+    #         )
+    #     else:
+    #         self.log(markdown_content, level=level)
 
-    def log_code(self, title: str, content: str, level: int = LogLevel.INFO) -> None:
-        self.log(
-            Panel(
-                Syntax(
-                    content,
-                    lexer="python",
-                    theme="monokai",
-                    word_wrap=True,
-                ),
-                title="[bold]" + title,
-                title_align="left",
-                box=box.HORIZONTALS,
-            ),
-            level=level,
-        )
+    # def log_code(self, title: str, content: str, level: int = LogLevel.INFO) -> None:
+    #     self.log(
+    #         Panel(
+    #             Syntax(
+    #                 content,
+    #                 lexer="python",
+    #                 theme="monokai",
+    #                 word_wrap=True,
+    #             ),
+    #             title="[bold]" + title,
+    #             title_align="left",
+    #             box=box.HORIZONTALS,
+    #         ),
+    #         level=level,
+    #     )
 
-    def log_rule(self, title: str, level: int = LogLevel.INFO) -> None:
-        self.log(
-            Rule(
-                "[bold]" + title,
-                characters="━",
-                style=YELLOW_HEX,
-            ),
-            level=LogLevel.INFO,
-        )
+    # def log_rule(self, title: str, level: int = LogLevel.INFO) -> None:
+    #     self.log(
+    #         Rule(
+    #             "[bold]" + title,
+    #             characters="━",
+    #             style=YELLOW_HEX,
+    #         ),
+    #         level=LogLevel.INFO,
+    #     )
 
-    def log_task(self, content: str, subtitle: str, level: int = LogLevel.INFO) -> None:
-        self.log(
-            Panel(
-                f"\n[bold]{content}\n",
-                title="[bold]New run",
-                subtitle=subtitle,
-                border_style=YELLOW_HEX,
-                subtitle_align="left",
-            ),
-            level=level,
-        )
+    # def log_task(self, content: str, subtitle: str, level: int = LogLevel.INFO) -> None:
+    #     self.log(
+    #         Panel(
+    #             f"\n[bold]{content}\n",
+    #             title="[bold]New run",
+    #             subtitle=subtitle,
+    #             border_style=YELLOW_HEX,
+    #             subtitle_align="left",
+    #         ),
+    #         level=level,
+    #     )
 
     def log_messages(self, messages: List) -> None:
         messages_as_string = "\n".join([json.dumps(dict(message), indent=4) for message in messages])
@@ -200,6 +200,126 @@ class AgentLogger:
         main_tree = Tree(f"[bold {YELLOW_HEX}]{agent.__class__.__name__}")
         build_agent_tree(main_tree, agent)
         self.console.print(main_tree)
+
+    def log(self, content, level: LogLevel = LogLevel.INFO, agent_name: Optional[str] = None):
+        """Log a message with the given level.
+        
+        Args:
+            content: The content to log.
+            level: The log level.
+            agent_name: The name of the agent that is generating this log.
+        """
+        if level.value > self.level:
+            return
+        
+        # If an agent name is provided, wrap content in a panel with the agent name
+        if agent_name and isinstance(content, str):
+            content = Panel(content, title=f"[bold blue]Agent: {agent_name}[/bold blue]")
+        elif agent_name:
+            # If content is already a Rich object like Panel or Group
+            if hasattr(content, "title") and content.title is None:
+                content.title = f"[bold blue]Agent: {agent_name}[/bold blue]"
+        
+        self.console.print(content)
+
+    def log_markdown(
+        self, content: str, title: Optional[str] = None, level: LogLevel = LogLevel.INFO, agent_name: Optional[str] = None
+    ):
+        """Log a markdown content with the given level.
+        
+        Args:
+            content: The markdown content to log.
+            title: An optional title for the markdown content.
+            level: The log level.
+            agent_name: The name of the agent that is generating this log.
+        """
+        if level.value > self.level:
+            return
+        
+        # Combine agent name with title if both are provided
+        panel_title = None
+        if agent_name and title:
+            panel_title = f"[bold blue]Agent: {agent_name}[/bold blue] - {title}"
+        elif agent_name:
+            panel_title = f"[bold blue]Agent: {agent_name}[/bold blue]"
+        elif title:
+            panel_title = title
+        
+        markdown = Markdown(content)
+        panel = Panel(markdown, title=panel_title)
+        self.console.print(panel)
+
+    def log_code(
+        self, content: str, title: Optional[str] = None, level: LogLevel = LogLevel.INFO, agent_name: Optional[str] = None
+    ):
+        """Log code content with the given level.
+        
+        Args:
+            content: The code content to log.
+            title: An optional title for the code content.
+            level: The log level.
+            agent_name: The name of the agent that is generating this log.
+        """
+        if level.value > self.level:
+            return
+        
+        # Combine agent name with title if both are provided
+        panel_title = None
+        if agent_name and title:
+            panel_title = f"[bold blue]Agent: {agent_name}[/bold blue] - {title}"
+        elif agent_name:
+            panel_title = f"[bold blue]Agent: {agent_name}[/bold blue]"
+        elif title:
+            panel_title = title
+        
+        code = Syntax(content, "python")
+        panel = Panel(code, title=panel_title)
+        self.console.print(panel)
+
+    def log_task(
+        self, content: str, subtitle: Optional[str] = None, level: LogLevel = LogLevel.INFO, agent_name: Optional[str] = None
+    ):
+        """Log a task with the given level.
+        
+        Args:
+            content: The task content to log.
+            subtitle: An optional subtitle for the task.
+            level: The log level.
+            agent_name: The name of the agent that is generating this log.
+        """
+        if level.value > self.level:
+            return
+        
+        # If agent_name is provided but not in subtitle, add it to the subtitle
+        if agent_name and subtitle and "Agent:" not in subtitle:
+            subtitle = f"Agent: {agent_name} - {subtitle}"
+        elif agent_name and not subtitle:
+            subtitle = f"Agent: {agent_name}"
+        
+        panel = Panel(
+            Text(content, style="green"),
+            title="Task",
+            subtitle=subtitle,
+            border_style="green",
+        )
+        self.console.print(panel)
+
+    def log_rule(self, title: str, level: LogLevel = LogLevel.INFO, agent_name: Optional[str] = None):
+        """Log a rule with the given level.
+        
+        Args:
+            title: The title of the rule.
+            level: The log level.
+            agent_name: The name of the agent that is generating this log.
+        """
+        if level.value > self.level:
+            return
+        
+        # Add agent name to the rule title if provided
+        if agent_name:
+            title = f"[bold blue]Agent: {agent_name}[/bold blue] - {title}"
+        
+        self.console.print(Rule(title))
 
 
 __all__ = ["AgentLogger", "Monitor"]

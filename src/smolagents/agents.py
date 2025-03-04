@@ -407,8 +407,8 @@ class MultiStepAgent:
         if additional_args is not None:
             self.state.update(additional_args)
             self.task += f"""
-You have been provided with these additional arguments, that you can access using the keys as variables in your python code:
-{str(additional_args)}."""
+    You have been provided with these additional arguments, that you can access using the keys as variables in your python code:
+    {str(additional_args)}."""
 
         self.system_prompt = self.initialize_system_prompt()
         self.memory.system_prompt = SystemPromptStep(system_prompt=self.system_prompt)
@@ -416,9 +416,11 @@ You have been provided with these additional arguments, that you can access usin
             self.memory.reset()
             self.monitor.reset()
 
+        # Use the agent name instead of model information in the task log
+        agent_name = self.name if hasattr(self, 'name') and self.name else self.agent_name
         self.logger.log_task(
             content=self.task.strip(),
-            subtitle=f"{type(self.model).__name__} - {(self.model.model_id if hasattr(self.model, 'model_id') else '')}",
+            subtitle=f"Agent: {agent_name}",  # Use agent name instead of model info
             level=LogLevel.INFO,
         )
 
@@ -440,69 +442,6 @@ You have been provided with these additional arguments, that you can access usin
         # Outputs are returned only at the end as a string. We only look at the last step
         return deque(self._run(task=self.task, images=images), maxlen=1)[0]
 
-    def _run(self, task: str, images: List[str] | None = None) -> Generator[ActionStep | AgentType, None, None]:
-        """
-        Run the agent in streaming mode and returns a generator of all the steps.
-
-        Args:
-            task (`str`): Task to perform.
-            images (`list[str]`): Paths to image(s).
-        """
-        final_answer = None
-        self.step_number = 1
-        while final_answer is None and self.step_number <= self.max_steps:
-            step_start_time = time.time()
-            memory_step = ActionStep(
-                step_number=self.step_number,
-                start_time=step_start_time,
-                observations_images=images,
-            )
-            try:
-                if self.planning_interval is not None and self.step_number % self.planning_interval == 1:
-                    self.planning_step(
-                        task,
-                        is_first_step=(self.step_number == 1),
-                        step=self.step_number,
-                    )
-                self.logger.log_rule(f"Step {self.step_number}", level=LogLevel.INFO)
-
-                # Run one step!
-                final_answer = self.step(memory_step)
-            except AgentError as e:
-                memory_step.error = e
-            finally:
-                memory_step.end_time = time.time()
-                memory_step.duration = memory_step.end_time - step_start_time
-                self.memory.steps.append(memory_step)
-                for callback in self.step_callbacks:
-                    # For compatibility with old callbacks that don't take the agent as an argument
-                    if len(inspect.signature(callback).parameters) == 1:
-                        callback(memory_step)
-                    else:
-                        callback(memory_step, agent=self)
-                self.step_number += 1
-                yield memory_step
-
-        if final_answer is None and self.step_number == self.max_steps + 1:
-            error_message = "Reached max steps."
-            final_answer = self.provide_final_answer(task, images)
-            final_memory_step = ActionStep(
-                step_number=self.step_number, error=AgentMaxStepsError(error_message, self.logger)
-            )
-            final_memory_step.action_output = final_answer
-            final_memory_step.end_time = time.time()
-            final_memory_step.duration = memory_step.end_time - step_start_time
-            self.memory.steps.append(final_memory_step)
-            for callback in self.step_callbacks:
-                # For compatibility with old callbacks that don't take the agent as an argument
-                if len(inspect.signature(callback).parameters) == 1:
-                    callback(final_memory_step)
-                else:
-                    callback(final_memory_step, agent=self)
-            yield final_memory_step
-
-        yield handle_agent_output_types(final_answer)
-
     def planning_step(self, task, is_first_step: bool, step: int) -> None:
         """
         Used periodically by the agent to plan the next steps to reach the objective.
@@ -512,6 +451,9 @@ You have been provided with these additional arguments, that you can access usin
             is_first_step (`bool`): If this step is not the first one, the plan should be an update over a previous plan.
             step (`int`): The number of the current step, used as an indication for the LLM.
         """
+        # Get agent name for panels
+        agent_name = self.name if hasattr(self, 'name') and self.name else self.agent_name
+        
         if is_first_step:
             message_prompt_facts = {
                 "role": MessageRole.SYSTEM,
@@ -523,10 +465,10 @@ You have been provided with these additional arguments, that you can access usin
                     {
                         "type": "text",
                         "text": f"""Here is the task:
-```
-{task}
-```
-Now begin!""",
+    ```
+    {task}
+    ```
+    Now begin!""",
                     }
                 ],
             }
@@ -560,13 +502,13 @@ Now begin!""",
             answer_plan = chat_message_plan.content
 
             final_plan_redaction = f"""Here is the plan of action that I will follow to solve the task:
-```
-{answer_plan}
-```"""
+    ```
+    {answer_plan}
+    ```"""
             final_facts_redaction = f"""Here are the facts that I know so far:
-```
-{answer_facts}
-```""".strip()
+    ```
+    {answer_facts}
+    ```""".strip()
             self.memory.steps.append(
                 PlanningStep(
                     model_input_messages=input_messages,
@@ -580,6 +522,7 @@ Now begin!""",
                 Rule("[bold]Initial plan", style="orange"),
                 Text(final_plan_redaction),
                 level=LogLevel.INFO,
+                agent_name=agent_name
             )
         else:  # update plan
             memory_messages = self.write_memory_to_messages(
@@ -629,9 +572,9 @@ Now begin!""",
                 task=task, plan_update=chat_message_plan.content
             )
             final_facts_redaction = f"""Here is the updated list of the facts that I know:
-```
-{facts_update}
-```"""
+    ```
+    {facts_update}
+    ```"""
             self.memory.steps.append(
                 PlanningStep(
                     model_input_messages=input_messages,
@@ -645,8 +588,8 @@ Now begin!""",
                 Rule("[bold]Updated plan", style="orange"),
                 Text(final_plan_redaction),
                 level=LogLevel.INFO,
+                agent_name=agent_name
             )
-
     def replay(self, detailed: bool = False):
         """Prints a pretty replay of the agent's steps.
 
@@ -715,6 +658,9 @@ class ToolCallingAgent(MultiStepAgent):
 
         # Add new step in logs
         memory_step.model_input_messages = memory_messages.copy()
+        
+        # Get agent name for panels
+        agent_name = self.name if hasattr(self, 'name') and self.name else self.agent_name
 
         try:
             model_message: ChatMessage = self.model(
@@ -738,6 +684,7 @@ class ToolCallingAgent(MultiStepAgent):
         self.logger.log(
             Panel(Text(f"Calling tool: '{tool_name}' with arguments: {tool_arguments}")),
             level=LogLevel.INFO,
+            agent_name=agent_name
         )
         if tool_name == "final_answer":
             if isinstance(tool_arguments, dict):
@@ -754,12 +701,14 @@ class ToolCallingAgent(MultiStepAgent):
                 self.logger.log(
                     f"[bold {YELLOW_HEX}]Final answer:[/bold {YELLOW_HEX}] Extracting key '{answer}' from state to return value '{final_answer}'.",
                     level=LogLevel.INFO,
+                    agent_name=agent_name
                 )
             else:
                 final_answer = answer
                 self.logger.log(
                     Text(f"Final answer: {final_answer}", style=f"bold {YELLOW_HEX}"),
                     level=LogLevel.INFO,
+                    agent_name=agent_name
                 )
 
             memory_step.action_output = final_answer
@@ -783,6 +732,7 @@ class ToolCallingAgent(MultiStepAgent):
             self.logger.log(
                 f"Observations: {updated_information.replace('[', '|')}",  # escape potential rich-tag-like components
                 level=LogLevel.INFO,
+                agent_name=agent_name
             )
             memory_step.observations = updated_information
             return None
@@ -884,6 +834,10 @@ class CodeAgent(MultiStepAgent):
 
         # Add new step in logs
         memory_step.model_input_messages = memory_messages.copy()
+        
+        # Get agent name for panels
+        agent_name = self.name if hasattr(self, 'name') and self.name else self.agent_name
+        
         try:
             additional_args = {"grammar": self.grammar} if self.grammar is not None else {}
             chat_message: ChatMessage = self.model(
@@ -901,6 +855,7 @@ class CodeAgent(MultiStepAgent):
             content=model_output,
             title="Output message of the LLM:",
             level=LogLevel.DEBUG,
+            agent_name=agent_name
         )
 
         # Parse the code output
@@ -918,22 +873,28 @@ class CodeAgent(MultiStepAgent):
             )
         ]
 
-        # ✅ Prompt the user for permission unless permission=False
+        # Ask for permission if needed
         if self.permission:
             print("\n🚨 **Agent wants to execute the following code:**\n")
             print(f"```python\n{code_action}\n```")
 
-            # ✅ User prompt: Press Enter (default Yes), type "y" or "yes" to execute, or "no" to abort
+            # User prompt: Press Enter (default Yes), type "y" or "yes" to execute, or "no" to abort
             response = input("\nPress Enter to execute, or type 'no' to abort: ").strip().lower()
 
             if response == "no":
                 print("🚫 Execution aborted by the user. Exiting program.")
-                sys.exit(1)  # ✅ Exit the program completely
+                import sys
+                sys.exit(1)
             else:
                 print("✅ Proceeding with execution.")
 
-        # ✅ If permission=False or user agrees, execute the code
-        self.logger.log_code(title="Executing parsed code:", content=code_action, level=LogLevel.INFO)
+        # Execute the code
+        self.logger.log_code(
+            title="Executing parsed code:", 
+            content=code_action, 
+            level=LogLevel.INFO,
+            agent_name=agent_name
+        )
         is_final_answer = False
         try:
             output, execution_logs, is_final_answer = self.python_executor(
@@ -956,12 +917,13 @@ class CodeAgent(MultiStepAgent):
                         Text(execution_logs),
                     ]
                     memory_step.observations = "Execution logs:\n" + execution_logs
-                    self.logger.log(Group(*execution_outputs_console), level=LogLevel.INFO)
+                    self.logger.log(Group(*execution_outputs_console), level=LogLevel.INFO, agent_name=agent_name)
             error_msg = str(e)
             if "Import of " in error_msg and " is not allowed" in error_msg:
                 self.logger.log(
                     "[bold red]Warning to user: Code execution failed due to an unauthorized import - Consider passing said import under `additional_authorized_imports` when initializing your CodeAgent.",
                     level=LogLevel.INFO,
+                    agent_name=agent_name
                 )
             raise AgentExecutionError(error_msg, self.logger)
 
@@ -975,10 +937,9 @@ class CodeAgent(MultiStepAgent):
                 style=(f"bold {YELLOW_HEX}" if is_final_answer else ""),
             ),
         ]
-        self.logger.log(Group(*execution_outputs_console), level=LogLevel.INFO)
+        self.logger.log(Group(*execution_outputs_console), level=LogLevel.INFO, agent_name=agent_name)
         memory_step.action_output = output
         return output if is_final_answer else None
-
 
 class CriticCodeAgent(CodeAgent):
     """
