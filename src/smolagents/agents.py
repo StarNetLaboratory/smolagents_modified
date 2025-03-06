@@ -14,54 +14,56 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import importlib.resources
+import importlib
 import inspect
+import json
+import os
 import re
+import tempfile
 import textwrap
 import time
 from collections import deque
 from logging import getLogger
-from typing import Any, Callable, Dict, Generator, List, Optional, Set, Tuple, Union
+from pathlib import Path
+from typing import Any, Callable, Dict, Generator, List, Optional, Set, Tuple, TypedDict, Union
 
+import jinja2
 import yaml
+from huggingface_hub import create_repo, metadata_update, snapshot_download, upload_folder
 from jinja2 import StrictUndefined, Template
 from rich.console import Group
 from rich.panel import Panel
 from rich.rule import Rule
 from rich.text import Text
 
-from smolagents.agent_types import AgentAudio, AgentImage, handle_agent_output_types
-from smolagents.memory import ActionStep, AgentMemory, PlanningStep, SystemPromptStep, TaskStep, ToolCall
-from smolagents.monitoring import (
+from .agent_types import AgentAudio, AgentImage, AgentType, handle_agent_output_types
+from .default_tools import TOOL_MAPPING, FinalAnswerTool
+from .local_python_executor import BASE_BUILTIN_MODULES, LocalPythonExecutor, PythonExecutor, fix_final_answer_code
+from .memory import ActionStep, AgentMemory, PlanningStep, SystemPromptStep, TaskStep, ToolCall
+from .models import (
+    ChatMessage,
+    MessageRole,
+    Model,
+)
+from .monitoring import (
     YELLOW_HEX,
     AgentLogger,
     LogLevel,
+    Monitor,
 )
-from smolagents.utils import (
+from .remote_executors import DockerExecutor, E2BExecutor
+from .tools import Tool
+from .utils import (
     AgentError,
     AgentExecutionError,
     AgentGenerationError,
     AgentMaxStepsError,
     AgentParsingError,
+    make_init_file,
     parse_code_blobs,
     parse_json_tool_call,
     truncate_content,
 )
-
-from .agent_types import AgentType
-from .default_tools import TOOL_MAPPING, FinalAnswerTool
-from .e2b_executor import E2BExecutor
-from .local_python_executor import (
-    BASE_BUILTIN_MODULES,
-    LocalPythonInterpreter,
-    fix_final_answer_code,
-)
-from .models import (
-    ChatMessage,
-    MessageRole,
-)
-from .monitoring import Monitor
-from .tools import Tool
 
 
 logger = getLogger(__name__)
@@ -80,6 +82,85 @@ def populate_template(template: str, variables: Dict[str, Any]) -> str:
         raise Exception(f"Error during jinja template rendering: {type(e).__name__}: {e}")
 
 
+class PlanningPromptTemplate(TypedDict):
+    """
+    Prompt templates for the planning step.
+
+    Args:
+        initial_facts (`str`): Initial facts prompt.
+        initial_plan (`str`): Initial plan prompt.
+        update_facts_pre_messages (`str`): Update facts pre-messages prompt.
+        update_facts_post_messages (`str`): Update facts post-messages prompt.
+        update_plan_pre_messages (`str`): Update plan pre-messages prompt.
+        update_plan_post_messages (`str`): Update plan post-messages prompt.
+    """
+
+    initial_facts: str
+    initial_plan: str
+    update_facts_pre_messages: str
+    update_facts_post_messages: str
+    update_plan_pre_messages: str
+    update_plan_post_messages: str
+
+
+class ManagedAgentPromptTemplate(TypedDict):
+    """
+    Prompt templates for the managed agent.
+
+    Args:
+        task (`str`): Task prompt.
+        report (`str`): Report prompt.
+    """
+
+    task: str
+    report: str
+
+
+class FinalAnswerPromptTemplate(TypedDict):
+    """
+    Prompt templates for the final answer.
+
+    Args:
+        pre_messages (`str`): Pre-messages prompt.
+        post_messages (`str`): Post-messages prompt.
+    """
+
+    pre_messages: str
+    post_messages: str
+
+
+class PromptTemplates(TypedDict):
+    """
+    Prompt templates for the agent.
+
+    Args:
+        system_prompt (`str`): System prompt.
+        planning ([`~agents.PlanningPromptTemplate`]): Planning prompt templates.
+        managed_agent ([`~agents.ManagedAgentPromptTemplate`]): Managed agent prompt templates.
+        final_answer ([`~agents.FinalAnswerPromptTemplate`]): Final answer prompt templates.
+    """
+
+    system_prompt: str
+    planning: PlanningPromptTemplate
+    managed_agent: ManagedAgentPromptTemplate
+    final_answer: FinalAnswerPromptTemplate
+
+
+EMPTY_PROMPT_TEMPLATES = PromptTemplates(
+    system_prompt="",
+    planning=PlanningPromptTemplate(
+        initial_facts="",
+        initial_plan="",
+        update_facts_pre_messages="",
+        update_facts_post_messages="",
+        update_plan_pre_messages="",
+        update_plan_post_messages="",
+    ),
+    managed_agent=ManagedAgentPromptTemplate(task="", report=""),
+    final_answer=FinalAnswerPromptTemplate(pre_messages="", post_messages=""),
+)
+
+
 class MultiStepAgent:
     """
     Agent class that solves the given task step by step, using the ReAct framework:
@@ -88,8 +169,8 @@ class MultiStepAgent:
     Args:
         tools (`list[Tool]`): [`Tool`]s that the agent can use.
         model (`Callable[[list[dict[str, str]]], ChatMessage]`): Model that will generate the agent's actions.
-        prompt_templates (`dict`, *optional*): Prompt templates.
-        max_steps (`int`, default `6`): Maximum number of steps the agent can take to solve the task.
+        prompt_templates ([`~agents.PromptTemplates`], *optional*): Prompt templates.
+        max_steps (`int`, default `20`): Maximum number of steps the agent can take to solve the task.
         tool_parser (`Callable`, *optional*): Function used to parse the tool calls from the LLM output.
         add_base_tools (`bool`, default `False`): Whether to add the base tools to the agent's tools.
         verbosity_level (`LogLevel`, default `LogLevel.INFO`): Level of verbosity of the agent's logs.
@@ -107,8 +188,8 @@ class MultiStepAgent:
         self,
         tools: List[Tool],
         model: Callable[[List[Dict[str, str]]], ChatMessage],
-        prompt_templates: Optional[dict] = None,
-        max_steps: int = 6,
+        prompt_templates: Optional[PromptTemplates] = None,
+        max_steps: int = 20,
         tool_parser: Optional[Callable] = None,
         add_base_tools: bool = False,
         verbosity_level: LogLevel = LogLevel.INFO,
@@ -121,37 +202,23 @@ class MultiStepAgent:
         provide_run_summary: bool = False,
         final_answer_checks: Optional[List[Callable]] = None,
     ):
-        if tool_parser is None:
-            tool_parser = parse_json_tool_call
         self.agent_name = self.__class__.__name__
         self.model = model
-        self.prompt_templates = prompt_templates or {}
+        self.prompt_templates = prompt_templates or EMPTY_PROMPT_TEMPLATES
         self.max_steps = max_steps
-        self.step_number: int = 0
-        self.tool_parser = tool_parser
+        self.step_number = 0
+        self.tool_parser = tool_parser or parse_json_tool_call
         self.grammar = grammar
         self.planning_interval = planning_interval
         self.state = {}
         self.name = name
         self.description = description
         self.provide_run_summary = provide_run_summary
+        self.final_answer_checks = final_answer_checks
 
-        self.managed_agents = {}
-        if managed_agents is not None:
-            for managed_agent in managed_agents:
-                assert managed_agent.name and managed_agent.description, (
-                    "All managed agents need both a name and a description!"
-                )
-            self.managed_agents = {agent.name: agent for agent in managed_agents}
-
-        for tool in tools:
-            assert isinstance(tool, Tool), f"This element is not of class Tool: {str(tool)}"
-        self.tools = {tool.name: tool for tool in tools}
-        if add_base_tools:
-            for tool_name, tool_class in TOOL_MAPPING.items():
-                if tool_name != "python_interpreter" or self.__class__.__name__ == "ToolCallingAgent":
-                    self.tools[tool_name] = tool_class()
-        self.tools["final_answer"] = FinalAnswerTool()
+        self._setup_managed_agents(managed_agents)
+        self._setup_tools(tools, add_base_tools)
+        self._validate_tools_and_managed_agents(tools, managed_agents)
 
         self.system_prompt = self.initialize_system_prompt()
         self.input_messages = None
@@ -161,7 +228,283 @@ class MultiStepAgent:
         self.monitor = Monitor(self.model, self.logger)
         self.step_callbacks = step_callbacks if step_callbacks is not None else []
         self.step_callbacks.append(self.monitor.update_metrics)
-        self.final_answer_checks = final_answer_checks
+
+    def _setup_managed_agents(self, managed_agents):
+        self.managed_agents = {}
+        if managed_agents:
+            assert all(agent.name and agent.description for agent in managed_agents), (
+                "All managed agents need both a name and a description!"
+            )
+            self.managed_agents = {agent.name: agent for agent in managed_agents}
+
+    def _setup_tools(self, tools, add_base_tools):
+        assert all(isinstance(tool, Tool) for tool in tools), "All elements must be instance of Tool (or a subclass)"
+        self.tools = {tool.name: tool for tool in tools}
+        if add_base_tools:
+            self.tools.update(
+                {
+                    name: cls()
+                    for name, cls in TOOL_MAPPING.items()
+                    if name != "python_interpreter" or self.__class__.__name__ == "ToolCallingAgent"
+                }
+            )
+        self.tools.setdefault("final_answer", FinalAnswerTool())
+
+    def _validate_tools_and_managed_agents(self, tools, managed_agents):
+        tool_and_managed_agent_names = [tool.name for tool in tools]
+        if managed_agents is not None:
+            tool_and_managed_agent_names += [agent.name for agent in managed_agents]
+        if self.name:
+            tool_and_managed_agent_names.append(self.name)
+        if len(tool_and_managed_agent_names) != len(set(tool_and_managed_agent_names)):
+            raise ValueError(
+                "Each tool or managed_agent should have a unique name! You passed these duplicate names: "
+                f"{[name for name in tool_and_managed_agent_names if tool_and_managed_agent_names.count(name) > 1]}"
+            )
+
+    def run(
+        self,
+        task: str,
+        stream: bool = False,
+        reset: bool = True,
+        images: Optional[List[str]] = None,
+        additional_args: Optional[Dict] = None,
+        max_steps: Optional[int] = None,
+    ):
+        """
+        Run the agent for the given task.
+
+        Args:
+            task (`str`): Task to perform.
+            stream (`bool`): Whether to run in a streaming way.
+            reset (`bool`): Whether to reset the conversation or keep it going from previous run.
+            images (`list[str]`, *optional*): Paths to image(s).
+            additional_args (`dict`, *optional*): Any other variables that you want to pass to the agent run, for instance images or dataframes. Give them clear names!
+            max_steps (`int`, *optional*): Maximum number of steps the agent can take to solve the task. if not provided, will use the agent's default value.
+
+        Example:
+        ```py
+        from smolagents import CodeAgent
+        agent = CodeAgent(tools=[])
+        agent.run("What is the result of 2 power 3.7384?")
+        ```
+        """
+        max_steps = max_steps or self.max_steps
+        self.task = task
+        if additional_args is not None:
+            self.state.update(additional_args)
+            self.task += f"""
+You have been provided with these additional arguments, that you can access using the keys as variables in your python code:
+{str(additional_args)}."""
+
+        self.system_prompt = self.initialize_system_prompt()
+        self.memory.system_prompt = SystemPromptStep(system_prompt=self.system_prompt)
+        if reset:
+            self.memory.reset()
+            self.monitor.reset()
+
+        self.logger.log_task(
+            content=self.task.strip(),
+            subtitle=f"{type(self.model).__name__} - {(self.model.model_id if hasattr(self.model, 'model_id') else '')}",
+            level=LogLevel.INFO,
+            title=self.name if hasattr(self, "name") else None,
+        )
+        self.memory.steps.append(TaskStep(task=self.task, task_images=images))
+
+        if getattr(self, "python_executor", None):
+            self.python_executor.send_variables(variables=self.state)
+            self.python_executor.send_tools({**self.tools, **self.managed_agents})
+
+        if stream:
+            # The steps are returned as they are executed through a generator to iterate on.
+            return self._run(task=self.task, max_steps=max_steps, images=images)
+        # Outputs are returned only at the end. We only look at the last step.
+        return deque(self._run(task=self.task, max_steps=max_steps, images=images), maxlen=1)[0]
+
+    def _run(
+        self, task: str, max_steps: int, images: List[str] | None = None
+    ) -> Generator[ActionStep | AgentType, None, None]:
+        final_answer = None
+        self.step_number = 1
+        while final_answer is None and self.step_number <= max_steps:
+            step_start_time = time.time()
+            memory_step = self._create_memory_step(step_start_time, images)
+            try:
+                final_answer = self._execute_step(task, memory_step)
+            except AgentError as e:
+                memory_step.error = e
+            finally:
+                self._finalize_step(memory_step, step_start_time)
+                yield memory_step
+                self.step_number += 1
+
+        if final_answer is None and self.step_number == max_steps + 1:
+            final_answer = self._handle_max_steps_reached(task, images, step_start_time)
+            yield memory_step
+        yield handle_agent_output_types(final_answer)
+
+    def _create_memory_step(self, step_start_time: float, images: List[str] | None) -> ActionStep:
+        return ActionStep(step_number=self.step_number, start_time=step_start_time, observations_images=images)
+
+    def _execute_step(self, task: str, memory_step: ActionStep) -> Union[None, Any]:
+        if self.planning_interval is not None and self.step_number % self.planning_interval == 1:
+            self.planning_step(task, is_first_step=(self.step_number == 1), step=self.step_number)
+        self.logger.log_rule(f"Step {self.step_number}", level=LogLevel.INFO)
+        final_answer = self.step(memory_step)
+        if final_answer is not None and self.final_answer_checks:
+            self._validate_final_answer(final_answer)
+        return final_answer
+
+    def _validate_final_answer(self, final_answer: Any):
+        for check_function in self.final_answer_checks:
+            try:
+                assert check_function(final_answer, self.memory)
+            except Exception as e:
+                raise AgentError(f"Check {check_function.__name__} failed with error: {e}", self.logger)
+
+    def _finalize_step(self, memory_step: ActionStep, step_start_time: float):
+        memory_step.end_time = time.time()
+        memory_step.duration = memory_step.end_time - step_start_time
+        self.memory.steps.append(memory_step)
+        for callback in self.step_callbacks:
+            # For compatibility with old callbacks that don't take the agent as an argument
+            callback(memory_step) if len(inspect.signature(callback).parameters) == 1 else callback(
+                memory_step, agent=self
+            )
+
+    def _handle_max_steps_reached(self, task: str, images: List[str], step_start_time: float) -> Any:
+        final_answer = self.provide_final_answer(task, images)
+        final_memory_step = ActionStep(
+            step_number=self.step_number, error=AgentMaxStepsError("Reached max steps.", self.logger)
+        )
+        final_memory_step.action_output = final_answer
+        final_memory_step.end_time = time.time()
+        final_memory_step.duration = final_memory_step.end_time - step_start_time
+        self.memory.steps.append(final_memory_step)
+        for callback in self.step_callbacks:
+            callback(final_memory_step) if len(inspect.signature(callback).parameters) == 1 else callback(
+                final_memory_step, agent=self
+            )
+        return final_answer
+
+    def planning_step(self, task, is_first_step: bool, step: int) -> None:
+        input_messages, facts_message, plan_message = (
+            self._generate_initial_plan(task) if is_first_step else self._generate_updated_plan(task, step)
+        )
+        self._record_planning_step(input_messages, facts_message, plan_message, is_first_step)
+
+    def _generate_initial_plan(self, task: str) -> Tuple[ChatMessage, ChatMessage]:
+        input_messages = [
+            {
+                "role": MessageRole.USER,
+                "content": [
+                    {
+                        "type": "text",
+                        "text": populate_template(
+                            self.prompt_templates["planning"]["initial_facts"], variables={"task": task}
+                        ),
+                    }
+                ],
+            },
+        ]
+        facts_message = self.model(input_messages)
+
+        message_prompt_plan = {
+            "role": MessageRole.USER,
+            "content": [
+                {
+                    "type": "text",
+                    "text": populate_template(
+                        self.prompt_templates["planning"]["initial_plan"],
+                        variables={
+                            "task": task,
+                            "tools": self.tools,
+                            "managed_agents": self.managed_agents,
+                            "answer_facts": facts_message.content,
+                        },
+                    ),
+                }
+            ],
+        }
+        plan_message = self.model([message_prompt_plan], stop_sequences=["<end_plan>"])
+        return input_messages, facts_message, plan_message
+
+    def _generate_updated_plan(self, task: str, step: int) -> Tuple[ChatMessage, ChatMessage]:
+        # Do not take the system prompt message from the memory
+        # summary_mode=False: Do not take previous plan steps to avoid influencing the new plan
+        memory_messages = self.write_memory_to_messages()[1:]
+        facts_update_pre = {
+            "role": MessageRole.SYSTEM,
+            "content": [{"type": "text", "text": self.prompt_templates["planning"]["update_facts_pre_messages"]}],
+        }
+        facts_update_post = {
+            "role": MessageRole.USER,
+            "content": [{"type": "text", "text": self.prompt_templates["planning"]["update_facts_post_messages"]}],
+        }
+        input_messages = [facts_update_pre] + memory_messages + [facts_update_post]
+        facts_message = self.model(input_messages)
+
+        update_plan_pre = {
+            "role": MessageRole.SYSTEM,
+            "content": [
+                {
+                    "type": "text",
+                    "text": populate_template(
+                        self.prompt_templates["planning"]["update_plan_pre_messages"], variables={"task": task}
+                    ),
+                }
+            ],
+        }
+        update_plan_post = {
+            "role": MessageRole.USER,
+            "content": [
+                {
+                    "type": "text",
+                    "text": populate_template(
+                        self.prompt_templates["planning"]["update_plan_post_messages"],
+                        variables={
+                            "task": task,
+                            "tools": self.tools,
+                            "managed_agents": self.managed_agents,
+                            "facts_update": facts_message.content,
+                            "remaining_steps": (self.max_steps - step),
+                        },
+                    ),
+                }
+            ],
+        }
+        plan_message = self.model(
+            [update_plan_pre] + memory_messages + [update_plan_post], stop_sequences=["<end_plan>"]
+        )
+        return input_messages, facts_message, plan_message
+
+    def _record_planning_step(
+        self, input_messages: list, facts_message: ChatMessage, plan_message: ChatMessage, is_first_step: bool
+    ) -> None:
+        if is_first_step:
+            facts = textwrap.dedent(f"""Here are the facts that I know so far:\n```\n{facts_message.content}\n```""")
+            plan = textwrap.dedent(
+                f"""Here is the plan of action that I will follow to solve the task:\n```\n{plan_message.content}\n```"""
+            )
+            log_message = "Initial plan"
+        else:
+            facts = textwrap.dedent(
+                f"""Here is the updated list of the facts that I know:\n```\n{facts_message.content}\n```"""
+            )
+            plan = textwrap.dedent(
+                f"""I still need to solve the task I was given:\n```\n{self.task}\n```\n\nHere is my new/updated plan of action to solve the task:\n```\n{plan_message.content}\n```"""
+            )
+            log_message = "Updated plan"
+        self.memory.steps.append(
+            PlanningStep(
+                model_input_messages=input_messages,
+                facts=facts,
+                plan=plan,
+                model_output_message_plan=plan_message,
+                model_output_message_facts=facts_message,
+            )
+        )
+        self.logger.log(Rule(f"[bold]{log_message}", style="orange"), Text(plan), level=LogLevel.INFO)
 
     @property
     def logs(self):
@@ -224,46 +567,33 @@ class MultiStepAgent:
         Returns:
             `str`: Final answer to the task.
         """
-        messages = [{"role": MessageRole.SYSTEM, "content": []}]
+        messages = [
+            {
+                "role": MessageRole.SYSTEM,
+                "content": [
+                    {
+                        "type": "text",
+                        "text": self.prompt_templates["final_answer"]["pre_messages"],
+                    }
+                ],
+            }
+        ]
         if images:
-            messages[0]["content"] = [
-                {
-                    "type": "text",
-                    "text": "An agent tried to answer a user query but it got stuck and failed to do so. You are tasked with providing an answer instead. Here is the agent's memory:",
-                }
-            ]
             messages[0]["content"].append({"type": "image"})
-            messages += self.write_memory_to_messages()[1:]
-            messages += [
-                {
-                    "role": MessageRole.USER,
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": f"Based on the above, please provide an answer to the following user request:\n{task}",
-                        }
-                    ],
-                }
-            ]
-        else:
-            messages[0]["content"] = [
-                {
-                    "type": "text",
-                    "text": "An agent tried to answer a user query but it got stuck and failed to do so. You are tasked with providing an answer instead. Here is the agent's memory:",
-                }
-            ]
-            messages += self.write_memory_to_messages()[1:]
-            messages += [
-                {
-                    "role": MessageRole.USER,
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": f"Based on the above, please provide an answer to the following user request:\n{task}",
-                        }
-                    ],
-                }
-            ]
+        messages += self.write_memory_to_messages()[1:]
+        messages += [
+            {
+                "role": MessageRole.USER,
+                "content": [
+                    {
+                        "type": "text",
+                        "text": populate_template(
+                            self.prompt_templates["final_answer"]["post_messages"], variables={"task": task}
+                        ),
+                    }
+                ],
+            }
+        ]
         try:
             chat_message: ChatMessage = self.model(messages)
             return chat_message.content
@@ -306,7 +636,7 @@ class MultiStepAgent:
             if tool_name in self.tools:
                 tool = self.tools[tool_name]
                 error_msg = (
-                    f"Error whene executing tool {tool_name} with arguments {arguments}: {type(e).__name__}: {e}\nYou should only use this tool with a correct input.\n"
+                    f"Error when executing tool {tool_name} with arguments {arguments}: {type(e).__name__}: {e}\nYou should only use this tool with a correct input.\n"
                     f"As a reminder, this tool's description is the following: '{tool.description}'.\nIt takes inputs: {tool.inputs} and returns output type {tool.output_type}"
                 )
                 raise AgentExecutionError(error_msg, self.logger)
@@ -321,300 +651,6 @@ class MultiStepAgent:
         """To be implemented in children classes. Should return either None if the step is not final."""
         pass
 
-    def run(
-        self,
-        task: str,
-        stream: bool = False,
-        reset: bool = True,
-        images: Optional[List[str]] = None,
-        additional_args: Optional[Dict] = None,
-    ):
-        """
-        Run the agent for the given task.
-
-        Args:
-            task (`str`): Task to perform.
-            stream (`bool`): Whether to run in a streaming way.
-            reset (`bool`): Whether to reset the conversation or keep it going from previous run.
-            images (`list[str]`, *optional*): Paths to image(s).
-            additional_args (`dict`): Any other variables that you want to pass to the agent run, for instance images or dataframes. Give them clear names!
-
-        Example:
-        ```py
-        from smolagents import CodeAgent
-        agent = CodeAgent(tools=[])
-        agent.run("What is the result of 2 power 3.7384?")
-        ```
-        """
-
-        self.task = task
-        if additional_args is not None:
-            self.state.update(additional_args)
-            self.task += f"""
-You have been provided with these additional arguments, that you can access using the keys as variables in your python code:
-{str(additional_args)}."""
-
-        self.system_prompt = self.initialize_system_prompt()
-        self.memory.system_prompt = SystemPromptStep(system_prompt=self.system_prompt)
-        if reset:
-            self.memory.reset()
-            self.monitor.reset()
-
-        self.logger.log_task(
-            content=self.task.strip(),
-            subtitle=f"{type(self.model).__name__} - {(self.model.model_id if hasattr(self.model, 'model_id') else '')}",
-            level=LogLevel.INFO,
-            title=self.name if hasattr(self, "name") else None,
-        )
-
-        self.memory.steps.append(TaskStep(task=self.task, task_images=images))
-
-        if stream:
-            # The steps are returned as they are executed through a generator to iterate on.
-            return self._run(task=self.task, images=images)
-        # Outputs are returned only at the end as a string. We only look at the last step
-        return deque(self._run(task=self.task, images=images), maxlen=1)[0]
-
-    def _run(self, task: str, images: List[str] | None = None) -> Generator[ActionStep | AgentType, None, None]:
-        """
-        Run the agent in streaming mode and returns a generator of all the steps.
-
-        Args:
-            task (`str`): Task to perform.
-            images (`list[str]`): Paths to image(s).
-        """
-        final_answer = None
-        self.step_number = 1
-        while final_answer is None and self.step_number <= self.max_steps:
-            step_start_time = time.time()
-            memory_step = ActionStep(
-                step_number=self.step_number,
-                start_time=step_start_time,
-                observations_images=images,
-            )
-            try:
-                if self.planning_interval is not None and self.step_number % self.planning_interval == 1:
-                    self.planning_step(
-                        task,
-                        is_first_step=(self.step_number == 1),
-                        step=self.step_number,
-                    )
-                self.logger.log_rule(f"Step {self.step_number}", level=LogLevel.INFO)
-
-                # Run one step!
-                final_answer = self.step(memory_step)
-                if final_answer is not None and self.final_answer_checks is not None:
-                    for check_function in self.final_answer_checks:
-                        try:
-                            assert check_function(final_answer, self.memory)
-                        except Exception as e:
-                            final_answer = None
-                            raise AgentError(f"Check {check_function.__name__} failed with error: {e}", self.logger)
-            except AgentError as e:
-                memory_step.error = e
-            finally:
-                memory_step.end_time = time.time()
-                memory_step.duration = memory_step.end_time - step_start_time
-                self.memory.steps.append(memory_step)
-                for callback in self.step_callbacks:
-                    # For compatibility with old callbacks that don't take the agent as an argument
-                    if len(inspect.signature(callback).parameters) == 1:
-                        callback(memory_step)
-                    else:
-                        callback(memory_step, agent=self)
-                self.step_number += 1
-                yield memory_step
-
-        if final_answer is None and self.step_number == self.max_steps + 1:
-            error_message = "Reached max steps."
-            final_answer = self.provide_final_answer(task, images)
-            final_memory_step = ActionStep(
-                step_number=self.step_number, error=AgentMaxStepsError(error_message, self.logger)
-            )
-            final_memory_step.action_output = final_answer
-            final_memory_step.end_time = time.time()
-            final_memory_step.duration = memory_step.end_time - step_start_time
-            self.memory.steps.append(final_memory_step)
-            for callback in self.step_callbacks:
-                # For compatibility with old callbacks that don't take the agent as an argument
-                if len(inspect.signature(callback).parameters) == 1:
-                    callback(final_memory_step)
-                else:
-                    callback(final_memory_step, agent=self)
-            yield final_memory_step
-
-        yield handle_agent_output_types(final_answer)
-
-    def planning_step(self, task, is_first_step: bool, step: int) -> None:
-        """
-        Used periodically by the agent to plan the next steps to reach the objective.
-
-        Args:
-            task (`str`): Task to perform.
-            is_first_step (`bool`): If this step is not the first one, the plan should be an update over a previous plan.
-            step (`int`): The number of the current step, used as an indication for the LLM.
-        """
-        if is_first_step:
-            message_prompt_facts = {
-                "role": MessageRole.SYSTEM,
-                "content": [{"type": "text", "text": self.prompt_templates["planning"]["initial_facts"]}],
-            }
-            message_prompt_task = {
-                "role": MessageRole.USER,
-                "content": [
-                    {
-                        "type": "text",
-                        "text": textwrap.dedent(
-                            f"""Here is the task:
-                            ```
-                            {task}
-                            ```
-                            Now begin!"""
-                        ),
-                    },
-                ],
-            }
-            input_messages = [message_prompt_facts, message_prompt_task]
-
-            chat_message_facts: ChatMessage = self.model(input_messages)
-            answer_facts = chat_message_facts.content
-
-            message_prompt_plan = {
-                "role": MessageRole.USER,
-                "content": [
-                    {
-                        "type": "text",
-                        "text": populate_template(
-                            self.prompt_templates["planning"]["initial_plan"],
-                            variables={
-                                "task": task,
-                                "tools": self.tools,
-                                "managed_agents": self.managed_agents,
-                                "answer_facts": answer_facts,
-                            },
-                        ),
-                    }
-                ],
-            }
-            chat_message_plan: ChatMessage = self.model(
-                [message_prompt_plan],
-                stop_sequences=["<end_plan>"],
-            )
-            answer_plan = chat_message_plan.content
-
-            final_plan_redaction = textwrap.dedent(
-                f"""Here is the plan of action that I will follow to solve the task:
-                ```
-                {answer_plan}
-                ```"""
-            )
-            final_facts_redaction = textwrap.dedent(
-                f"""Here are the facts that I know so far:
-                ```
-                {answer_facts}
-                ```""".strip()
-            )
-            self.memory.steps.append(
-                PlanningStep(
-                    model_input_messages=input_messages,
-                    plan=final_plan_redaction,
-                    facts=final_facts_redaction,
-                    model_output_message_plan=chat_message_plan,
-                    model_output_message_facts=chat_message_facts,
-                )
-            )
-            self.logger.log(
-                Rule("[bold]Initial plan", style="orange"),
-                Text(final_plan_redaction),
-                level=LogLevel.INFO,
-            )
-        else:  # update plan
-            # Do not take the system prompt message from the memory
-            # summary_mode=False: Do not take previous plan steps to avoid influencing the new plan
-            memory_messages = self.write_memory_to_messages()[1:]
-
-            # Redact updated facts
-            facts_update_pre_messages = {
-                "role": MessageRole.SYSTEM,
-                "content": [{"type": "text", "text": self.prompt_templates["planning"]["update_facts_pre_messages"]}],
-            }
-            facts_update_post_messages = {
-                "role": MessageRole.USER,
-                "content": [{"type": "text", "text": self.prompt_templates["planning"]["update_facts_post_messages"]}],
-            }
-            input_messages = [facts_update_pre_messages] + memory_messages + [facts_update_post_messages]
-            chat_message_facts: ChatMessage = self.model(input_messages)
-            facts_update = chat_message_facts.content
-
-            # Redact updated plan
-            update_plan_pre_messages = {
-                "role": MessageRole.SYSTEM,
-                "content": [
-                    {
-                        "type": "text",
-                        "text": populate_template(
-                            self.prompt_templates["planning"]["update_plan_pre_messages"], variables={"task": task}
-                        ),
-                    }
-                ],
-            }
-            update_plan_post_messages = {
-                "role": MessageRole.USER,
-                "content": [
-                    {
-                        "type": "text",
-                        "text": populate_template(
-                            self.prompt_templates["planning"]["update_plan_post_messages"],
-                            variables={
-                                "task": task,
-                                "tools": self.tools,
-                                "managed_agents": self.managed_agents,
-                                "facts_update": facts_update,
-                                "remaining_steps": (self.max_steps - step),
-                            },
-                        ),
-                    }
-                ],
-            }
-            chat_message_plan: ChatMessage = self.model(
-                [update_plan_pre_messages] + memory_messages + [update_plan_post_messages],
-                stop_sequences=["<end_plan>"],
-            )
-
-            # Log final facts and plan
-            final_plan_redaction = textwrap.dedent(
-                f"""I still need to solve the task I was given:
-                ```
-                {task}
-                ```
-
-                Here is my new/updated plan of action to solve the task:
-                ```
-                {chat_message_plan.content}
-                ```"""
-            )
-
-            final_facts_redaction = textwrap.dedent(
-                f"""Here is the updated list of the facts that I know:
-                ```
-                {facts_update}
-                ```"""
-            )
-            self.memory.steps.append(
-                PlanningStep(
-                    model_input_messages=input_messages,
-                    plan=final_plan_redaction,
-                    facts=final_facts_redaction,
-                    model_output_message_plan=chat_message_plan,
-                    model_output_message_facts=chat_message_facts,
-                )
-            )
-            self.logger.log(
-                Rule("[bold]Updated plan", style="orange"),
-                Text(final_plan_redaction),
-                level=LogLevel.INFO,
-            )
-
     def replay(self, detailed: bool = False):
         """Prints a pretty replay of the agent's steps.
 
@@ -625,9 +661,8 @@ You have been provided with these additional arguments, that you can access usin
         self.memory.replay(self.logger, detailed=detailed)
 
     def __call__(self, task: str, **kwargs):
-        """
-        This methd is called only by a manager agent.
-        Adds additional prompting for the managed agent, runs it, and wraps the output.
+        """Adds additional prompting for the managed agent, runs it, and wraps the output.
+        This method is called only by a managed agent.
         """
         full_task = populate_template(
             self.prompt_templates["managed_agent"]["task"],
@@ -645,6 +680,321 @@ You have been provided with these additional arguments, that you can access usin
             answer += "\n</summary_of_work>"
         return answer
 
+    def save(self, output_dir: str, relative_path: Optional[str] = None):
+        """
+        Saves the relevant code files for your agent. This will copy the code of your agent in `output_dir` as well as autogenerate:
+
+        - a `tools` folder containing the logic for each of the tools under `tools/{tool_name}.py`.
+        - a `managed_agents` folder containing the logic for each of the managed agents.
+        - an `agent.json` file containing a dictionary representing your agent.
+        - a `prompt.yaml` file containing the prompt templates used by your agent.
+        - an `app.py` file providing a UI for your agent when it is exported to a Space with `agent.push_to_hub()`
+        - a `requirements.txt` containing the names of the modules used by your tool (as detected when inspecting its
+          code)
+
+        Args:
+            output_dir (`str`): The folder in which you want to save your tool.
+        """
+        make_init_file(output_dir)
+
+        # Recursively save managed agents
+        if self.managed_agents:
+            make_init_file(os.path.join(output_dir, "managed_agents"))
+            for agent_name, agent in self.managed_agents.items():
+                agent_suffix = f"managed_agents.{agent_name}"
+                if relative_path:
+                    agent_suffix = relative_path + "." + agent_suffix
+                agent.save(os.path.join(output_dir, "managed_agents", agent_name), relative_path=agent_suffix)
+
+        class_name = self.__class__.__name__
+
+        # Save tools to different .py files
+        for tool in self.tools.values():
+            make_init_file(os.path.join(output_dir, "tools"))
+            tool.save(os.path.join(output_dir, "tools"), tool_file_name=tool.name, make_gradio_app=False)
+
+        # Save prompts to yaml
+        yaml_prompts = yaml.safe_dump(
+            self.prompt_templates,
+            default_style="|",  # This forces block literals for all strings
+            default_flow_style=False,
+            width=float("inf"),
+            sort_keys=False,
+            allow_unicode=True,
+            indent=2,
+        )
+
+        with open(os.path.join(output_dir, "prompts.yaml"), "w", encoding="utf-8") as f:
+            f.write(yaml_prompts)
+
+        # Save agent dictionary to json
+        agent_dict = self.to_dict()
+        agent_dict["tools"] = [tool.name for tool in self.tools.values()]
+        with open(os.path.join(output_dir, "agent.json"), "w", encoding="utf-8") as f:
+            json.dump(agent_dict, f, indent=4)
+
+        # Save requirements
+        with open(os.path.join(output_dir, "requirements.txt"), "w", encoding="utf-8") as f:
+            f.writelines(f"{r}\n" for r in agent_dict["requirements"])
+
+        # Make agent.py file with Gradio UI
+        agent_name = f"agent_{self.name}" if getattr(self, "name", None) else "agent"
+        managed_agent_relative_path = relative_path + "." if relative_path is not None else ""
+        app_template = textwrap.dedent("""
+            import yaml
+            import os
+            from smolagents import GradioUI, {{ class_name }}, {{ agent_dict['model']['class'] }}
+
+            # Get current directory path
+            CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+            {% for tool in tools.values() -%}
+            from {{managed_agent_relative_path}}tools.{{ tool.name }} import {{ tool.__class__.__name__ }} as {{ tool.name | camelcase }}
+            {% endfor %}
+            {% for managed_agent in managed_agents.values() -%}
+            from {{managed_agent_relative_path}}managed_agents.{{ managed_agent.name }}.app import agent_{{ managed_agent.name }}
+            {% endfor %}
+
+            model = {{ agent_dict['model']['class'] }}(
+            {% for key in agent_dict['model']['data'] if key not in ['class', 'last_input_token_count', 'last_output_token_count'] -%}
+                {{ key }}={{ agent_dict['model']['data'][key]|repr }},
+            {% endfor %})
+
+            {% for tool in tools.values() -%}
+            {{ tool.name }} = {{ tool.name | camelcase }}()
+            {% endfor %}
+
+            with open(os.path.join(CURRENT_DIR, "prompts.yaml"), 'r') as stream:
+                prompt_templates = yaml.safe_load(stream)
+
+            {{ agent_name }} = {{ class_name }}(
+                model=model,
+                tools=[{% for tool_name in tools.keys() if tool_name != "final_answer" %}{{ tool_name }}{% if not loop.last %}, {% endif %}{% endfor %}],
+                managed_agents=[{% for subagent_name in managed_agents.keys() %}agent_{{ subagent_name }}{% if not loop.last %}, {% endif %}{% endfor %}],
+                {% for attribute_name, value in agent_dict.items() if attribute_name not in ["model", "tools", "prompt_templates", "authorized_imports", "managed_agents", "requirements"] -%}
+                {{ attribute_name }}={{ value|repr }},
+                {% endfor %}prompt_templates=prompt_templates
+            )
+            if __name__ == "__main__":
+                GradioUI({{ agent_name }}).launch()
+            """).strip()
+        template_env = jinja2.Environment(loader=jinja2.BaseLoader(), undefined=jinja2.StrictUndefined)
+        template_env.filters["repr"] = repr
+        template_env.filters["camelcase"] = lambda value: "".join(word.capitalize() for word in value.split("_"))
+        template = template_env.from_string(app_template)
+
+        # Render the app.py file from Jinja2 template
+        app_text = template.render(
+            {
+                "agent_name": agent_name,
+                "class_name": class_name,
+                "agent_dict": agent_dict,
+                "tools": self.tools,
+                "managed_agents": self.managed_agents,
+                "managed_agent_relative_path": managed_agent_relative_path,
+            }
+        )
+
+        with open(os.path.join(output_dir, "app.py"), "w", encoding="utf-8") as f:
+            f.write(app_text + "\n")  # Append newline at the end
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Converts agent into a dictionary."""
+        # TODO: handle serializing step_callbacks and final_answer_checks
+        for attr in ["final_answer_checks", "step_callbacks"]:
+            if getattr(self, attr, None):
+                self.logger.log(f"This agent has {attr}: they will be ignored by this method.", LogLevel.INFO)
+
+        tool_dicts = [tool.to_dict() for tool in self.tools.values()]
+        tool_requirements = {req for tool in self.tools.values() for req in tool.to_dict()["requirements"]}
+        managed_agents_requirements = {
+            req for managed_agent in self.managed_agents.values() for req in managed_agent.to_dict()["requirements"]
+        }
+        requirements = tool_requirements | managed_agents_requirements
+        if hasattr(self, "authorized_imports"):
+            requirements.update(
+                {package.split(".")[0] for package in self.authorized_imports if package not in BASE_BUILTIN_MODULES}
+            )
+
+        agent_dict = {
+            "tools": tool_dicts,
+            "model": {
+                "class": self.model.__class__.__name__,
+                "data": self.model.to_dict(),
+            },
+            "managed_agents": {
+                managed_agent.name: managed_agent.__class__.__name__ for managed_agent in self.managed_agents.values()
+            },
+            "prompt_templates": self.prompt_templates,
+            "max_steps": self.max_steps,
+            "verbosity_level": int(self.logger.level),
+            "grammar": self.grammar,
+            "planning_interval": self.planning_interval,
+            "name": self.name,
+            "description": self.description,
+            "requirements": list(requirements),
+        }
+        if hasattr(self, "authorized_imports"):
+            agent_dict["authorized_imports"] = self.authorized_imports
+        if hasattr(self, "executor_type"):
+            agent_dict["executor_type"] = self.executor_type
+            agent_dict["executor_kwargs"] = self.executor_kwargs
+        if hasattr(self, "max_print_outputs_length"):
+            agent_dict["max_print_outputs_length"] = self.max_print_outputs_length
+        return agent_dict
+
+    @classmethod
+    def from_hub(
+        cls,
+        repo_id: str,
+        token: Optional[str] = None,
+        trust_remote_code: bool = False,
+        **kwargs,
+    ):
+        """
+        Loads an agent defined on the Hub.
+
+        <Tip warning={true}>
+
+        Loading a tool from the Hub means that you'll download the tool and execute it locally.
+        ALWAYS inspect the tool you're downloading before loading it within your runtime, as you would do when
+        installing a package using pip/npm/apt.
+
+        </Tip>
+
+        Args:
+            repo_id (`str`):
+                The name of the repo on the Hub where your tool is defined.
+            token (`str`, *optional*):
+                The token to identify you on hf.co. If unset, will use the token generated when running
+                `huggingface-cli login` (stored in `~/.huggingface`).
+            trust_remote_code(`bool`, *optional*, defaults to False):
+                This flags marks that you understand the risk of running remote code and that you trust this tool.
+                If not setting this to True, loading the tool from Hub will fail.
+            kwargs (additional keyword arguments, *optional*):
+                Additional keyword arguments that will be split in two: all arguments relevant to the Hub (such as
+                `cache_dir`, `revision`, `subfolder`) will be used when downloading the files for your agent, and the
+                others will be passed along to its init.
+        """
+        if not trust_remote_code:
+            raise ValueError(
+                "Loading an agent from Hub requires to acknowledge you trust its code: to do so, pass `trust_remote_code=True`."
+            )
+
+        # Get the agent's Hub folder.
+        download_kwargs = {"token": token, "repo_type": "space"} | {
+            key: kwargs.pop(key)
+            for key in [
+                "cache_dir",
+                "force_download",
+                "proxies",
+                "revision",
+                "local_files_only",
+            ]
+            if key in kwargs
+        }
+
+        download_folder = Path(snapshot_download(repo_id=repo_id, **download_kwargs))
+        return cls.from_folder(download_folder, **kwargs)
+
+    @classmethod
+    def from_folder(cls, folder: Union[str, Path], **kwargs):
+        """Loads an agent from a local folder.
+
+        Args:
+            folder (`str` or `Path`): The folder where the agent is saved.
+            **kwargs: Additional keyword arguments that will be passed to the agent's init.
+        """
+        folder = Path(folder)
+        agent_dict = json.loads((folder / "agent.json").read_text())
+
+        # Recursively get managed agents
+        managed_agents = []
+        for managed_agent_name, managed_agent_class in agent_dict["managed_agents"].items():
+            agent_cls = getattr(importlib.import_module("smolagents.agents"), managed_agent_class)
+            managed_agents.append(agent_cls.from_folder(folder / "managed_agents" / managed_agent_name))
+
+        tools = []
+        for tool_name in agent_dict["tools"]:
+            tool_code = (folder / "tools" / f"{tool_name}.py").read_text()
+            tools.append(Tool.from_code(tool_code))
+
+        model_class: Model = getattr(importlib.import_module("smolagents.models"), agent_dict["model"]["class"])
+        model = model_class.from_dict(agent_dict["model"]["data"])
+
+        args = dict(
+            model=model,
+            tools=tools,
+            managed_agents=managed_agents,
+            name=agent_dict["name"],
+            description=agent_dict["description"],
+            max_steps=agent_dict["max_steps"],
+            planning_interval=agent_dict["planning_interval"],
+            grammar=agent_dict["grammar"],
+            verbosity_level=agent_dict["verbosity_level"],
+        )
+        if cls.__name__ == "CodeAgent":
+            args["additional_authorized_imports"] = agent_dict["authorized_imports"]
+            args["executor_type"] = agent_dict["executor_type"]
+            args["executor_kwargs"] = agent_dict["executor_kwargs"]
+            args["max_print_outputs_length"] = agent_dict["max_print_outputs_length"]
+        args.update(kwargs)
+        return cls(**args)
+
+    def push_to_hub(
+        self,
+        repo_id: str,
+        commit_message: str = "Upload agent",
+        private: Optional[bool] = None,
+        token: Optional[Union[bool, str]] = None,
+        create_pr: bool = False,
+    ) -> str:
+        """
+        Upload the agent to the Hub.
+
+        Parameters:
+            repo_id (`str`):
+                The name of the repository you want to push to. It should contain your organization name when
+                pushing to a given organization.
+            commit_message (`str`, *optional*, defaults to `"Upload agent"`):
+                Message to commit while pushing.
+            private (`bool`, *optional*, defaults to `None`):
+                Whether to make the repo private. If `None`, the repo will be public unless the organization's default is private. This value is ignored if the repo already exists.
+            token (`bool` or `str`, *optional*):
+                The token to use as HTTP bearer authorization for remote files. If unset, will use the token generated
+                when running `huggingface-cli login` (stored in `~/.huggingface`).
+            create_pr (`bool`, *optional*, defaults to `False`):
+                Whether to create a PR with the uploaded files or directly commit.
+        """
+        repo_url = create_repo(
+            repo_id=repo_id,
+            token=token,
+            private=private,
+            exist_ok=True,
+            repo_type="space",
+            space_sdk="gradio",
+        )
+        repo_id = repo_url.repo_id
+        metadata_update(
+            repo_id,
+            {"tags": ["smolagents", "agent"]},
+            repo_type="space",
+            token=token,
+            overwrite=True,
+        )
+
+        with tempfile.TemporaryDirectory() as work_dir:
+            self.save(work_dir)
+            logger.info(f"Uploading the following files to {repo_id}: {','.join(os.listdir(work_dir))}")
+            return upload_folder(
+                repo_id=repo_id,
+                commit_message=commit_message,
+                folder_path=work_dir,
+                token=token,
+                create_pr=create_pr,
+                repo_type="space",
+            )
+
 
 class ToolCallingAgent(MultiStepAgent):
     """
@@ -653,7 +1003,7 @@ class ToolCallingAgent(MultiStepAgent):
     Args:
         tools (`list[Tool]`): [`Tool`]s that the agent can use.
         model (`Callable[[list[dict[str, str]]], ChatMessage]`): Model that will generate the agent's actions.
-        prompt_templates (`dict`, *optional*): Prompt templates.
+        prompt_templates ([`~agents.PromptTemplates`], *optional*): Prompt templates.
         planning_interval (`int`, *optional*): Interval at which the agent will run a planning step.
         **kwargs: Additional keyword arguments.
     """
@@ -662,7 +1012,7 @@ class ToolCallingAgent(MultiStepAgent):
         self,
         tools: List[Tool],
         model: Callable[[List[Dict[str, str]]], ChatMessage],
-        prompt_templates: Optional[dict] = None,
+        prompt_templates: Optional[PromptTemplates] = None,
         planning_interval: Optional[int] = None,
         **kwargs,
     ):
@@ -775,11 +1125,12 @@ class CodeAgent(MultiStepAgent):
     Args:
         tools (`list[Tool]`): [`Tool`]s that the agent can use.
         model (`Callable[[list[dict[str, str]]], ChatMessage]`): Model that will generate the agent's actions.
-        prompt_templates (`dict`, *optional*): Prompt templates.
+        prompt_templates ([`~agents.PromptTemplates`], *optional*): Prompt templates.
         grammar (`dict[str, str]`, *optional*): Grammar used to parse the LLM output.
         additional_authorized_imports (`list[str]`, *optional*): Additional authorized imports for the agent.
         planning_interval (`int`, *optional*): Interval at which the agent will run a planning step.
-        use_e2b_executor (`bool`, default `False`): Whether to use the E2B executor for remote code execution.
+        executor_type (`str`, default `"local"`): Which executor type to use between `"local"`, `"e2b"`, or `"docker"`.
+        executor_kwargs (`dict`, *optional*): Additional arguments to pass to initialize the executor.
         max_print_outputs_length (`int`, *optional*): Maximum length of the print outputs.
         **kwargs: Additional keyword arguments.
 
@@ -789,16 +1140,18 @@ class CodeAgent(MultiStepAgent):
         self,
         tools: List[Tool],
         model: Callable[[List[Dict[str, str]]], ChatMessage],
-        prompt_templates: Optional[dict] = None,
+        prompt_templates: Optional[PromptTemplates] = None,
         grammar: Optional[Dict[str, str]] = None,
         additional_authorized_imports: Optional[List[str]] = None,
         planning_interval: Optional[int] = None,
-        use_e2b_executor: bool = False,
+        executor_type: str = "local",
+        executor_kwargs: Optional[Dict[str, Any]] = None,
         max_print_outputs_length: Optional[int] = None,
         **kwargs,
     ):
         self.additional_authorized_imports = additional_authorized_imports if additional_authorized_imports else []
         self.authorized_imports = list(set(BASE_BUILTIN_MODULES) | set(self.additional_authorized_imports))
+        self.max_print_outputs_length = max_print_outputs_length
         prompt_templates = prompt_templates or yaml.safe_load(
             importlib.resources.files("smolagents.prompts").joinpath("code_agent.yaml").read_text()
         )
@@ -815,25 +1168,26 @@ class CodeAgent(MultiStepAgent):
                 "Caution: you set an authorization for all imports, meaning your agent can decide to import any package it deems necessary. This might raise issues if the package is not installed in your environment.",
                 0,
             )
+        self.executor_type = executor_type
+        self.executor_kwargs = executor_kwargs or {}
+        self.python_executor = self.create_python_executor(executor_type, self.executor_kwargs)
 
-        if use_e2b_executor and len(self.managed_agents) > 0:
-            raise Exception(
-                f"You passed both {use_e2b_executor=} and some managed agents. Managed agents is not yet supported with remote code execution."
-            )
-
-        all_tools = {**self.tools, **self.managed_agents}
-        if use_e2b_executor:
-            self.python_executor = E2BExecutor(
-                self.additional_authorized_imports,
-                list(all_tools.values()),
-                self.logger,
-            )
-        else:
-            self.python_executor = LocalPythonInterpreter(
-                self.additional_authorized_imports,
-                all_tools,
-                max_print_outputs_length=max_print_outputs_length,
-            )
+    def create_python_executor(self, executor_type: str, kwargs: Dict[str, Any]) -> PythonExecutor:
+        match executor_type:
+            case "e2b" | "docker":
+                if self.managed_agents:
+                    raise Exception("Managed agents are not yet supported with remote code execution.")
+                if executor_type == "e2b":
+                    return E2BExecutor(self.additional_authorized_imports, self.logger, **kwargs)
+                else:
+                    return DockerExecutor(self.additional_authorized_imports, self.logger, **kwargs)
+            case "local":
+                return LocalPythonExecutor(
+                    self.additional_authorized_imports,
+                    max_print_outputs_length=self.max_print_outputs_length,
+                )
+            case _:  # if applicable
+                raise ValueError(f"Unsupported executor type: {executor_type}")
 
     def initialize_system_prompt(self) -> str:
         system_prompt = populate_template(
@@ -899,10 +1253,7 @@ class CodeAgent(MultiStepAgent):
         self.logger.log_code(title="Executing parsed code:", content=code_action, level=LogLevel.INFO)
         is_final_answer = False
         try:
-            output, execution_logs, is_final_answer = self.python_executor(
-                code_action,
-                self.state,
-            )
+            output, execution_logs, is_final_answer = self.python_executor(code_action)
             execution_outputs_console = []
             if len(execution_logs) > 0:
                 execution_outputs_console += [
@@ -941,471 +1292,3 @@ class CodeAgent(MultiStepAgent):
         self.logger.log(Group(*execution_outputs_console), level=LogLevel.INFO)
         memory_step.action_output = output
         return output if is_final_answer else None
-
-# class CriticCodeAgent(CodeAgent):
-#     """
-#     A CodeAgent with a critic capability that reviews code before execution.
-    
-#     The critic checks for typos, errors, and logical issues before allowing code execution.
-#     If the critic does not accept the proposed code, the main agent revises its approach.
-    
-#     Args:
-#         tools (`list[Tool]`): [`Tool`]s that the agent can use.
-#         model (`Callable[[list[dict[str, str]]], ChatMessage]`): Model that will generate the agent's actions.
-#         critic_agent (`MultiStepAgent`, *optional*): An agent that will be used as a critic.
-#                                                     Preferably a ToolCallingAgent with no tools.
-#         critic_model (`Callable[[list[dict[str, str]]], ChatMessage]`, *optional*): Model that will be used as the critic
-#                                                                                  if critic_agent is not provided.
-#                                                                                  If not provided, the main model is used.
-#         system_prompt (`str`, *optional*): System prompt that will be used to generate the agent's actions.
-#         critic_system_prompt (`str`, *optional*): System prompt for the critic if critic_agent is not provided.
-#                                                 If not provided, a default one is used.
-#         max_critic_attempts (`int`, default `3`): Maximum number of critic review cycles before forcing execution.
-#         revision_prompt (`str`, *optional*): Template for prompting the main agent to revise its approach.
-#         **kwargs: Additional keyword arguments to pass to the parent CodeAgent.
-#     """
-
-#     def __init__(
-#         self,
-#         tools: List[Tool],
-#         model: Callable[[List[Dict[str, str]]], ChatMessage],
-#         critic_agent: Optional['MultiStepAgent'] = None,
-#         critic_model: Optional[Callable[[List[Dict[str, str]]], ChatMessage]] = None,
-#         system_prompt: Optional[str] = None,
-#         critic_system_prompt: Optional[str] = None,
-#         max_critic_attempts: int = 3,
-#         revision_prompt: Optional[str] = None,
-#         **kwargs,
-#     ):
-#         # Ensure the system prompt includes the managed_agents_descriptions placeholder
-#         if system_prompt is None:
-#             # Use default CodeAgent system prompt which should include the placeholder
-#             pass
-#         elif "{{managed_agents_descriptions}}" not in system_prompt:
-#             # Add the placeholder if it's missing
-#             system_prompt = system_prompt + "\n\n{{managed_agents_descriptions}}"
-        
-#         super().__init__(tools=tools, model=model, system_prompt=system_prompt, **kwargs)
-        
-#         # Default critic system prompt
-#         if critic_system_prompt is None:
-#             self.critic_system_prompt = """You are a code review critic. Your job is to analyze code and reasoning provided by another AI agent.
-            
-# Your task is to:
-# 1. Check for typos, syntax errors, or obvious bugs in the code
-# 2. Verify that the reasoning is sound and logically follows from the problem
-# 3. Ensure the code actually implements what the reasoning describes
-# 4. Look for edge cases or potential issues that weren't considered
-# 5. Verify that the code uses the right tool arguments and follows proper conventions
-
-# After your analysis, you MUST end with one of these two statements:
-# - "ACCEPT: [Brief reason for acceptance]" - if the code looks correct and ready to execute
-# - "NOT ACCEPT: [Detailed explanation of issues]" - if you found problems that should be fixed
-
-# Be thorough but focused. Only identify genuine issues, not style preferences or minor optimizations.
-# Your feedback will be used to improve the code before execution."""
-#         else:
-#             self.critic_system_prompt = critic_system_prompt
-        
-#         # Set up the critic - either use provided critic_agent or create one automatically
-#         if critic_agent is not None:
-#             self.critic_agent = critic_agent
-#         else:
-#             # If critic_model is provided, use it; otherwise, use the main model
-#             critic_model_to_use = critic_model if critic_model is not None else model
-            
-#             # Import here to avoid circular imports
-#             from smolagents import ToolCallingAgent
-            
-#             critic_system_prompt = self.critic_system_prompt
-#             if "{{managed_agents_descriptions}}" not in critic_system_prompt:
-#                 critic_system_prompt = critic_system_prompt + "\n\n{{managed_agents_descriptions}}"
-            
-#             # Create a ToolCallingAgent internally as the critic
-#             self.critic_agent = ToolCallingAgent(
-#                 tools=[],  # No tools needed for critique
-#                 model=critic_model_to_use,
-#                 # verbosity_level='2',  # Match main agent's verbosity
-#                 system_prompt=critic_system_prompt,
-#                 name="CriticAgent",
-#                 description="Reviews code and reasoning without executing it. Provides ACCEPT or NOT ACCEPT decisions.",
-#                 add_base_tools=False,
-#             )
-            
-#             # We don't need these anymore since we're always using a critic agent
-#             self.critic_model = None
-        
-#         self.max_critic_attempts = max_critic_attempts
-        
-#         # Default revision prompt if none provided
-#         if revision_prompt is None:
-#             self.revision_prompt = """
-# The critic has reviewed your code and reasoning, and has NOT ACCEPTED it for the following reasons:
-
-# {feedback}
-
-# Please revise your approach to address these issues. Provide an improved solution with updated reasoning and code.
-# """
-#         else:
-#             self.revision_prompt = revision_prompt
-            
-#     def step(self, memory_step: ActionStep) -> Union[None, Any]:
-#         """
-#         Perform one step with critic review before code execution.
-#         For each step, the agent will consult with the critic until it receives approval
-#         or reaches the maximum number of attempts.
-        
-#         Returns None if the step is not final.
-#         """
-#         # Get messages from memory for the main agent's input
-#         memory_messages = self.write_memory_to_messages()
-#         self.input_messages = memory_messages.copy()
-        
-#         # Add new step in logs
-#         memory_step.model_input_messages = memory_messages.copy()
-#         critic_attempts = 0
-#         code_action = None
-        
-#         # Check if the final_answer tool is being used directly
-#         is_direct_final_answer = False
-        
-#         while critic_attempts < self.max_critic_attempts:
-#             try:
-#                 if critic_attempts > 0:
-#                     # If this is a retry based on critic feedback, add a special message to prompt revision
-#                     revision_message = {
-#                         "role": MessageRole.USER,
-#                         "content": [
-#                             {
-#                                 "type": "text", 
-#                                 "text": self.revision_prompt.format(feedback=memory_step.critic_steps[-1].feedback)
-#                             }
-#                         ],
-#                     }
-#                     self.input_messages.append(revision_message)
-                
-#                 # Get response from the main agent
-#                 additional_args = {"grammar": self.grammar} if self.grammar is not None else {}
-#                 chat_message: ChatMessage = self.model(
-#                     self.input_messages,
-#                     stop_sequences=["<end_code>", "Observation:"],
-#                     **additional_args,
-#                 )
-#                 memory_step.model_output_message = chat_message
-#                 model_output = chat_message.content
-#                 memory_step.model_output = model_output
-                
-#                 self.logger.log_markdown(
-#                     content=model_output,
-#                     title=f"Output from the main agent (attempt {critic_attempts + 1}):",
-#                     level=LogLevel.DEBUG,
-#                 )
-                
-#                 # Try to parse the code output
-#                 try:
-#                     code_action = fix_final_answer_code(parse_code_blobs(model_output))
-                    
-#                     # Check if the code is directly calling final_answer with a critic response
-#                     if "final_answer(" in code_action.lower() and "not accept:" in code_action.lower():
-#                         self.logger.log(
-#                             Panel(Text("Detected main agent attempting to return critic feedback directly. Forcing agent to revise.", style="red")),
-#                             level=LogLevel.INFO,
-#                         )
-                        
-#                         # Force another iteration with explicit instructions
-#                         is_direct_final_answer = True
-                        
-#                         # Create a placeholder CriticStep to add to memory
-#                         critic_step = CriticStep(start_time=time.time())
-#                         critic_step.feedback = """NOT ACCEPT: You are returning the critic's feedback as your final answer instead of addressing the issues.
-                        
-# You need to:
-# 1. Understand the feedback from the critic
-# 2. Revise your code to fix the identified issues
-# 3. Provide a new solution that addresses all concerns
-
-# Do NOT return critic feedback as your answer. Fix the problems and submit an improved solution."""
-#                         critic_step.accepted = False
-#                         critic_step.end_time = time.time()
-#                         critic_step.duration = critic_step.end_time - critic_step.start_time
-                        
-#                         memory_step.critic_steps = memory_step.critic_steps or []
-#                         memory_step.critic_steps.append(critic_step)
-                        
-#                         critic_attempts += 1
-#                         continue
-                        
-#                 except Exception as e:
-#                     error_msg = f"Error in code parsing:\n{e}\nMake sure to provide correct code blobs."
-#                     raise AgentParsingError(error_msg, self.logger)
-                
-#                 # Skip critic review if we already identified a direct final_answer issue
-#                 if not is_direct_final_answer:
-#                     # Send the proposed code and reasoning to the critic
-#                     critic_step = self._critic_review(model_output, code_action)
-#                     memory_step.critic_steps = memory_step.critic_steps or []
-#                     memory_step.critic_steps.append(critic_step)
-                    
-#                     # Check if the critic accepted the code
-#                     if critic_step.accepted:
-#                         self.logger.log(
-#                             Panel(Text(f"Critic accepted the code (attempt {critic_attempts + 1}). Proceeding with execution.", style="green")),
-#                             level=LogLevel.INFO,
-#                         )
-#                         break
-#                     else:
-#                         self.logger.log(
-#                             Panel(Text(f"Critic rejected the code (attempt {critic_attempts + 1}/{self.max_critic_attempts}).\nFeedback: {critic_step.feedback}", style="yellow")),
-#                             level=LogLevel.INFO,
-#                         )
-                
-#                 # Reset the direct final answer flag
-#                 is_direct_final_answer = False
-#                 critic_attempts += 1
-                
-#             except AgentGenerationError as e:
-#                 raise e
-            
-#         if critic_attempts == self.max_critic_attempts:
-#             self.logger.log(
-#                 Panel(Text(f"Max critic attempts ({self.max_critic_attempts}) reached. Proceeding with last code version.", style="red")),
-#                 level=LogLevel.INFO,
-#             )
-        
-#         # Store the final code action
-#         from smolagents.memory import ToolCall
-#         memory_step.tool_calls = [ToolCall(
-#             name="python_interpreter",
-#             arguments=code_action,
-#             id=f"call_{len(self.memory.steps)}",
-#         )]
-
-#         # If permission flag is enabled, ask for user permission
-#         if self.permission:
-#             self.logger.log(
-#                 Panel(Text(f"Main Agent wants to execute the following code:\n```python\n{code_action}\n```.", style="red")),
-#                 level=LogLevel.INFO,
-#             )
-            
-#             # Show critic acceptance status
-#             if memory_step.critic_steps and memory_step.critic_steps[-1].accepted:
-#                 self.logger.log(
-#                     Panel(Text(f"The critic has ACCEPTED this code.", style="black")),
-#                     level=LogLevel.INFO,
-#                 )
-#             else:
-#                 self.logger.log(
-#                     Panel(Text(f"The critic did NOT ACCEPT this code after multiple attempts.", style="red")),
-#                     level=LogLevel.INFO,
-#                 )           
-                
-#             response = input("\nPress Enter to execute, or type 'no' to abort: ").strip().lower()
-#             if response == "no" or response == 'n':
-#                 self.logger.log(
-#                     Panel(Text(f"🚫 User aborted execution. Exiting program.", style="black")),
-#                     level=LogLevel.INFO,
-#                 )                  
-#                 import sys
-#                 sys.exit(1)
-#             else:
-#                 self.logger.log(
-#                     Panel(Text(f"✅ User accepted execution", style="black")),
-#                     level=LogLevel.INFO,
-#                 )   
-#         # Execute the code
-#         # self.logger.log_code(title="Executing parsed code:", content=code_action, level=LogLevel.INFO) #redundant for user to see
-#         is_final_answer = False
-        
-#         try:
-#             output, execution_logs, is_final_answer = self.python_executor(
-#                 code_action,
-#                 self.state,
-#             )
-#             execution_outputs_console = []
-#             if len(execution_logs) > 0:
-#                 execution_outputs_console += [
-#                     Text("Execution logs:", style="bold"),
-#                     Text(execution_logs),
-#                 ]
-#             observation = "Execution logs:\n" + execution_logs
-#         except Exception as e:
-#             if hasattr(self.python_executor, "state") and "_print_outputs" in self.python_executor.state:
-#                 execution_logs = str(self.python_executor.state["_print_outputs"])
-#                 if len(execution_logs) > 0:
-#                     execution_outputs_console = [
-#                         Text("Execution logs:", style="bold"),
-#                         Text(execution_logs),
-#                     ]
-#                     memory_step.observations = "Execution logs:\n" + execution_logs
-#                     self.logger.log(Group(*execution_outputs_console), level=LogLevel.INFO)
-#             error_msg = str(e)
-#             if "Import of " in error_msg and " is not allowed" in error_msg:
-#                 self.logger.log(
-#                     "[bold red]Warning to user: Code execution failed due to an unauthorized import - Consider passing said import under `additional_authorized_imports` when initializing your CodeAgent.",
-#                     level=LogLevel.INFO,
-#                 )
-#             raise AgentExecutionError(error_msg, self.logger)
-
-#         truncated_output = truncate_content(str(output))
-#         observation += "Last output from code snippet:\n" + truncated_output
-#         memory_step.observations = observation
-
-#         execution_outputs_console += [
-#             Text(
-#                 f"{('Out - Final answer' if is_final_answer else 'Out')}: {truncated_output}",
-#                 style=(f"bold {YELLOW_HEX}" if is_final_answer else ""),
-#             ),
-#         ]
-#         # self.logger.log(Group(*execution_outputs_console), level=LogLevel.INFO)
-#         self.logger.log(
-#             Panel(Text(Group(*execution_outputs_console), style="bold {YELLOW_HEX}")),
-#             level=LogLevel.INFO,
-#             )   
-#         memory_step.action_output = output
-#         return output if is_final_answer else None
-        
-
-#     def _critic_review(self, model_output: str, code_action: str) -> CriticStep:
-#         """
-#         Send the proposed code and reasoning to the critic for review.
-
-#         Args:
-#             model_output (str): The full output from the main agent, including reasoning
-#             code_action (str): The parsed code that would be executed
-
-#         Returns:
-#             CriticStep: A structure containing the critic's review, feedback, and acceptance decision
-#         """
-#         critic_step = CriticStep(start_time=time.time())
-
-#         critic_request = f"""Please analyze the following agent reasoning and proposed code thoroughly:
-
-#         AGENT REASONING AND CODE:
-#         {model_output}
-
-#         PARSED CODE THAT WILL BE EXECUTED:
-#         ```python
-#         {code_action}
-#         ```
-
-#         Leverage your analytical capabilities to evaluate:
-
-#         Whether the reasoning is sound and fully addresses the problem.
-#         If the code correctly implements the described approach.
-#         Whether there are any bugs, edge cases, or logical errors.
-#         If the solution is efficient and well-structured.
-#         How well the solution meets the original requirements.
-#         Provide a comprehensive analysis with specific details about strengths and weaknesses. If you find issues, explain exactly what they are and why they matter.
-
-#         Your response MUST end with one of the following:
-
-#         "ACCEPT: Your brief justification" - if the code is correct and addresses the requirements.
-#         "NOT ACCEPT: Your Ssecific, detailed explanation of issues to fix" - if you found problems.
-#         "NOT SURE: Why you are unsure" - if you could not provide feedback and the agent should proceed with caution.
-#         Be specific and actionable in your feedback. Do not use generic placeholders."""
-            
-#         try:
-#             # Invoke the critic agent
-#             critic_response = self.critic_agent.run(critic_request, reset=True)
-#             critic_step.model_output_message = critic_response
-
-
-#             if hasattr(critic_response, 'content'):
-#                 if isinstance(critic_response.content, list):
-#                     critic_feedback = " ".join(map(str, critic_response.content)).strip()  # Convert list to string
-#                 else:
-#                     critic_feedback = str(critic_response.content).strip()
-#             else:
-#                 critic_feedback = str(critic_response).strip()
-
-#             critic_step.feedback = critic_feedback
-
-#             # Ensure feedback ends with an expected format
-#             print(f'{critic_feedback.startswith}=') ##### Debug 
-#             if not (critic_feedback.startswith("ACCEPT:") or 
-#                     critic_feedback.startswith("NOT ACCEPT:") or 
-#                     critic_feedback.startswith("NOT SURE:")):
-#                 self.logger.log(
-#                     "Critic response did not conform to expected format. Requesting re-evaluation.",
-#                     level=LogLevel.INFO,
-#                 )
-
-#                 retry_request = f"""Your response did not follow the required format or lacked sufficient detail.
-
-#                     AGENT REASONING AND CODE:
-#                     {model_output}
-
-#                     PARSED CODE THAT WILL BE EXECUTED:
-#                     ```python
-#                     {code_action}
-#                     ```
-
-#                     Provide a proper response ending with:
-
-#                     "ACCEPT: [Your reasoning]" if the code is correct.
-#                     "NOT ACCEPT: [Specific, detailed explanation of issues]" if there are problems.
-#                     "NOT SURE: [Why you are unsure]" if you cannot assess this properly.
-#                     Do not use placeholders. Provide specific, actionable feedback."""
-                
-#                 retry_response = self.critic_agent.run(retry_request, reset=True)
-                
-#                 if hasattr(retry_response, 'content'):
-#                     if isinstance(retry_response.content, list):
-#                         retry_feedback = " ".join(map(str, retry_response.content)).strip()  # Convert list to string
-#                     else:
-#                         retry_feedback = str(retry_response.content).strip()
-#                 else:
-#                     retry_feedback = str(retry_response).strip()
-
-#                 # Use retry response if it is properly formatted
-#                 if retry_feedback.startswith(("ACCEPT:", "NOT ACCEPT:", "NOT SURE:")):
-#                     critic_feedback = retry_feedback
-#                     critic_step.feedback = retry_feedback
-
-#                 else:
-#                     # Provide a structured fallback if the retry still fails
-#                     print('critic_feedback changed to not sure') ### debug
-#                     critic_feedback = """NOT SURE: The proposed solution may need improvements:
-
-#         1. Code correctness: The logic may have flaws that prevent it from working as intended
-#         2. Problem coverage: The solution may not fully address all requirements or handle all cases
-#         3. Error handling: Edge cases might not be properly handled
-#         4. Implementation: There may be inefficiencies or structural issues in the approach
-
-#         Please refine the solution considering these factors and re-evaluate."""
-#                     critic_step.feedback = critic_feedback
-
-#             # Determine acceptance based on final feedback
-#             lower_feedback = critic_feedback.lower()
-#             if lower_feedback.startswith("accept:"):
-#                 critic_step.accepted = True
-#             elif lower_feedback.startswith("not accept:"):
-#                 critic_step.accepted = False  
-#             else:
-#                 critic_step.accepted = False  # Default to rejection if unsure
-#                 # self.logger.log("Critic was unsure about the correctness of the solution. Proceed with caution.", level=LogLevel.INFO)
-
-
-#             # Log final critic feedback
-#             self.logger.log_markdown(
-#                 content=critic_step.feedback,
-#                 title="Critic Review:",
-#                 level=LogLevel.DEBUG,
-#             )
-
-#         except Exception as e:
-#             critic_step.feedback = f"Error in critic review: {str(e)}"
-#             critic_step.accepted = False  # Default to not accepting code
-#             self.logger.log(
-
-#                 f"Error in critic review: {str(e)}. Defaulting to NOT accepting the code.",
-#                 level=LogLevel.INFO,
-#             )
-
-#         critic_step.end_time = time.time()
-#         critic_step.duration = critic_step.end_time - critic_step.start_time
-
-#         return critic_step
-
-
-__all__ = ["MultiStepAgent", "CodeAgent", "ToolCallingAgent", "AgentMemory"]
