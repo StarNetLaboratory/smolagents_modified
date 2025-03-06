@@ -942,5 +942,470 @@ class CodeAgent(MultiStepAgent):
         memory_step.action_output = output
         return output if is_final_answer else None
 
+class CriticCodeAgent(CodeAgent):
+    """
+    A CodeAgent with a critic capability that reviews code before execution.
+    
+    The critic checks for typos, errors, and logical issues before allowing code execution.
+    If the critic does not accept the proposed code, the main agent revises its approach.
+    
+    Args:
+        tools (`list[Tool]`): [`Tool`]s that the agent can use.
+        model (`Callable[[list[dict[str, str]]], ChatMessage]`): Model that will generate the agent's actions.
+        critic_agent (`MultiStepAgent`, *optional*): An agent that will be used as a critic.
+                                                    Preferably a ToolCallingAgent with no tools.
+        critic_model (`Callable[[list[dict[str, str]]], ChatMessage]`, *optional*): Model that will be used as the critic
+                                                                                 if critic_agent is not provided.
+                                                                                 If not provided, the main model is used.
+        system_prompt (`str`, *optional*): System prompt that will be used to generate the agent's actions.
+        critic_system_prompt (`str`, *optional*): System prompt for the critic if critic_agent is not provided.
+                                                If not provided, a default one is used.
+        max_critic_attempts (`int`, default `3`): Maximum number of critic review cycles before forcing execution.
+        revision_prompt (`str`, *optional*): Template for prompting the main agent to revise its approach.
+        **kwargs: Additional keyword arguments to pass to the parent CodeAgent.
+    """
 
-__all__ = ["MultiStepAgent", "CodeAgent", "ToolCallingAgent", "AgentMemory"]
+    def __init__(
+        self,
+        tools: List[Tool],
+        model: Callable[[List[Dict[str, str]]], ChatMessage],
+        critic_agent: Optional['MultiStepAgent'] = None,
+        critic_model: Optional[Callable[[List[Dict[str, str]]], ChatMessage]] = None,
+        system_prompt: Optional[str] = None,
+        critic_system_prompt: Optional[str] = None,
+        max_critic_attempts: int = 3,
+        revision_prompt: Optional[str] = None,
+        **kwargs,
+    ):
+        # Ensure the system prompt includes the managed_agents_descriptions placeholder
+        if system_prompt is None:
+            # Use default CodeAgent system prompt which should include the placeholder
+            pass
+        elif "{{managed_agents_descriptions}}" not in system_prompt:
+            # Add the placeholder if it's missing
+            system_prompt = system_prompt + "\n\n{{managed_agents_descriptions}}"
+        
+        super().__init__(tools=tools, model=model, system_prompt=system_prompt, **kwargs)
+        
+        # Default critic system prompt
+        if critic_system_prompt is None:
+            self.critic_system_prompt = """You are a code review critic. Your job is to analyze code and reasoning provided by another AI agent.
+            
+Your task is to:
+1. Check for typos, syntax errors, or obvious bugs in the code
+2. Verify that the reasoning is sound and logically follows from the problem
+3. Ensure the code actually implements what the reasoning describes
+4. Look for edge cases or potential issues that weren't considered
+5. Verify that the code uses the right tool arguments and follows proper conventions
+
+After your analysis, you MUST end with one of these two statements:
+- "ACCEPT: [Brief reason for acceptance]" - if the code looks correct and ready to execute
+- "NOT ACCEPT: [Detailed explanation of issues]" - if you found problems that should be fixed
+
+Be thorough but focused. Only identify genuine issues, not style preferences or minor optimizations.
+Your feedback will be used to improve the code before execution."""
+        else:
+            self.critic_system_prompt = critic_system_prompt
+        
+        # Set up the critic - either use provided critic_agent or create one automatically
+        if critic_agent is not None:
+            self.critic_agent = critic_agent
+        else:
+            # If critic_model is provided, use it; otherwise, use the main model
+            critic_model_to_use = critic_model if critic_model is not None else model
+            
+            # Import here to avoid circular imports
+            from smolagents import ToolCallingAgent
+            
+            critic_system_prompt = self.critic_system_prompt
+            if "{{managed_agents_descriptions}}" not in critic_system_prompt:
+                critic_system_prompt = critic_system_prompt + "\n\n{{managed_agents_descriptions}}"
+            
+            # Create a ToolCallingAgent internally as the critic
+            self.critic_agent = ToolCallingAgent(
+                tools=[],  # No tools needed for critique
+                model=critic_model_to_use,
+                # verbosity_level='2',  # Match main agent's verbosity
+                system_prompt=critic_system_prompt,
+                name="CriticAgent",
+                description="Reviews code and reasoning without executing it. Provides ACCEPT or NOT ACCEPT decisions.",
+                add_base_tools=False,
+            )
+            
+            # We don't need these anymore since we're always using a critic agent
+            self.critic_model = None
+        
+        self.max_critic_attempts = max_critic_attempts
+        
+        # Default revision prompt if none provided
+        if revision_prompt is None:
+            self.revision_prompt = """
+The critic has reviewed your code and reasoning, and has NOT ACCEPTED it for the following reasons:
+
+{feedback}
+
+Please revise your approach to address these issues. Provide an improved solution with updated reasoning and code.
+"""
+        else:
+            self.revision_prompt = revision_prompt
+            
+    def step(self, memory_step: ActionStep) -> Union[None, Any]:
+        """
+        Perform one step with critic review before code execution.
+        For each step, the agent will consult with the critic until it receives approval
+        or reaches the maximum number of attempts.
+        
+        Returns None if the step is not final.
+        """
+        # Get messages from memory for the main agent's input
+        memory_messages = self.write_memory_to_messages()
+        self.input_messages = memory_messages.copy()
+        
+        # Add new step in logs
+        memory_step.model_input_messages = memory_messages.copy()
+        critic_attempts = 0
+        code_action = None
+        
+        # Check if the final_answer tool is being used directly
+        is_direct_final_answer = False
+        
+        while critic_attempts < self.max_critic_attempts:
+            try:
+                if critic_attempts > 0:
+                    # If this is a retry based on critic feedback, add a special message to prompt revision
+                    revision_message = {
+                        "role": MessageRole.USER,
+                        "content": [
+                            {
+                                "type": "text", 
+                                "text": self.revision_prompt.format(feedback=memory_step.critic_steps[-1].feedback)
+                            }
+                        ],
+                    }
+                    self.input_messages.append(revision_message)
+                
+                # Get response from the main agent
+                additional_args = {"grammar": self.grammar} if self.grammar is not None else {}
+                chat_message: ChatMessage = self.model(
+                    self.input_messages,
+                    stop_sequences=["<end_code>", "Observation:"],
+                    **additional_args,
+                )
+                memory_step.model_output_message = chat_message
+                model_output = chat_message.content
+                memory_step.model_output = model_output
+                
+                self.logger.log_markdown(
+                    content=model_output,
+                    title=f"Output from the main agent (attempt {critic_attempts + 1}):",
+                    level=LogLevel.DEBUG,
+                )
+                
+                # Try to parse the code output
+                try:
+                    code_action = fix_final_answer_code(parse_code_blobs(model_output))
+                    
+                    # Check if the code is directly calling final_answer with a critic response
+                    if "final_answer(" in code_action.lower() and "not accept:" in code_action.lower():
+                        self.logger.log(
+                            Panel(Text("Detected main agent attempting to return critic feedback directly. Forcing agent to revise.", style="red")),
+                            level=LogLevel.INFO,
+                        )
+                        
+                        # Force another iteration with explicit instructions
+                        is_direct_final_answer = True
+                        
+                        # Create a placeholder CriticStep to add to memory
+                        critic_step = CriticStep(start_time=time.time())
+                        critic_step.feedback = """NOT ACCEPT: You are returning the critic's feedback as your final answer instead of addressing the issues.
+                        
+You need to:
+1. Understand the feedback from the critic
+2. Revise your code to fix the identified issues
+3. Provide a new solution that addresses all concerns
+
+Do NOT return critic feedback as your answer. Fix the problems and submit an improved solution."""
+                        critic_step.accepted = False
+                        critic_step.end_time = time.time()
+                        critic_step.duration = critic_step.end_time - critic_step.start_time
+                        
+                        memory_step.critic_steps = memory_step.critic_steps or []
+                        memory_step.critic_steps.append(critic_step)
+                        
+                        critic_attempts += 1
+                        continue
+                        
+                except Exception as e:
+                    error_msg = f"Error in code parsing:\n{e}\nMake sure to provide correct code blobs."
+                    raise AgentParsingError(error_msg, self.logger)
+                
+                # Skip critic review if we already identified a direct final_answer issue
+                if not is_direct_final_answer:
+                    # Send the proposed code and reasoning to the critic
+                    critic_step = self._critic_review(model_output, code_action)
+                    memory_step.critic_steps = memory_step.critic_steps or []
+                    memory_step.critic_steps.append(critic_step)
+                    
+                    # Check if the critic accepted the code
+                    if critic_step.accepted:
+                        self.logger.log(
+                            Panel(Text(f"Critic accepted the code (attempt {critic_attempts + 1}). Proceeding with execution.", style="green")),
+                            level=LogLevel.INFO,
+                        )
+                        break
+                    else:
+                        self.logger.log(
+                            Panel(Text(f"Critic rejected the code (attempt {critic_attempts + 1}/{self.max_critic_attempts}).\nFeedback: {critic_step.feedback}", style="yellow")),
+                            level=LogLevel.INFO,
+                        )
+                
+                # Reset the direct final answer flag
+                is_direct_final_answer = False
+                critic_attempts += 1
+                
+            except AgentGenerationError as e:
+                raise e
+            
+        if critic_attempts == self.max_critic_attempts:
+            self.logger.log(
+                Panel(Text(f"Max critic attempts ({self.max_critic_attempts}) reached. Proceeding with last code version.", style="red")),
+                level=LogLevel.INFO,
+            )
+        
+        # Store the final code action
+        from smolagents.memory import ToolCall
+        memory_step.tool_calls = [ToolCall(
+            name="python_interpreter",
+            arguments=code_action,
+            id=f"call_{len(self.memory.steps)}",
+        )]
+
+        # If permission flag is enabled, ask for user permission
+        if self.permission:
+            self.logger.log(
+                Panel(Text(f"Main Agent wants to execute the following code:\n```python\n{code_action}\n```.", style="red")),
+                level=LogLevel.INFO,
+            )
+            
+            # Show critic acceptance status
+            if memory_step.critic_steps and memory_step.critic_steps[-1].accepted:
+                self.logger.log(
+                    Panel(Text(f"The critic has ACCEPTED this code.", style="black")),
+                    level=LogLevel.INFO,
+                )
+            else:
+                self.logger.log(
+                    Panel(Text(f"The critic did NOT ACCEPT this code after multiple attempts.", style="red")),
+                    level=LogLevel.INFO,
+                )           
+                
+            response = input("\nPress Enter to execute, or type 'no' to abort: ").strip().lower()
+            if response == "no" or response == 'n':
+                self.logger.log(
+                    Panel(Text(f"🚫 User aborted execution. Exiting program.", style="black")),
+                    level=LogLevel.INFO,
+                )                  
+                import sys
+                sys.exit(1)
+            else:
+                self.logger.log(
+                    Panel(Text(f"✅ User accepted execution", style="black")),
+                    level=LogLevel.INFO,
+                )   
+        # Execute the code
+        # self.logger.log_code(title="Executing parsed code:", content=code_action, level=LogLevel.INFO) #redundant for user to see
+        is_final_answer = False
+        
+        try:
+            output, execution_logs, is_final_answer = self.python_executor(
+                code_action,
+                self.state,
+            )
+            execution_outputs_console = []
+            if len(execution_logs) > 0:
+                execution_outputs_console += [
+                    Text("Execution logs:", style="bold"),
+                    Text(execution_logs),
+                ]
+            observation = "Execution logs:\n" + execution_logs
+        except Exception as e:
+            if hasattr(self.python_executor, "state") and "_print_outputs" in self.python_executor.state:
+                execution_logs = str(self.python_executor.state["_print_outputs"])
+                if len(execution_logs) > 0:
+                    execution_outputs_console = [
+                        Text("Execution logs:", style="bold"),
+                        Text(execution_logs),
+                    ]
+                    memory_step.observations = "Execution logs:\n" + execution_logs
+                    self.logger.log(Group(*execution_outputs_console), level=LogLevel.INFO)
+            error_msg = str(e)
+            if "Import of " in error_msg and " is not allowed" in error_msg:
+                self.logger.log(
+                    "[bold red]Warning to user: Code execution failed due to an unauthorized import - Consider passing said import under `additional_authorized_imports` when initializing your CodeAgent.",
+                    level=LogLevel.INFO,
+                )
+            raise AgentExecutionError(error_msg, self.logger)
+
+        truncated_output = truncate_content(str(output))
+        observation += "Last output from code snippet:\n" + truncated_output
+        memory_step.observations = observation
+
+        execution_outputs_console += [
+            Text(
+                f"{('Out - Final answer' if is_final_answer else 'Out')}: {truncated_output}",
+                style=(f"bold {YELLOW_HEX}" if is_final_answer else ""),
+            ),
+        ]
+        # self.logger.log(Group(*execution_outputs_console), level=LogLevel.INFO)
+        self.logger.log(
+            Panel(Text(Group(*execution_outputs_console), style="bold {YELLOW_HEX}")),
+            level=LogLevel.INFO,
+            )   
+        memory_step.action_output = output
+        return output if is_final_answer else None
+        
+
+    def _critic_review(self, model_output: str, code_action: str) -> CriticStep:
+        """
+        Send the proposed code and reasoning to the critic for review.
+
+        Args:
+            model_output (str): The full output from the main agent, including reasoning
+            code_action (str): The parsed code that would be executed
+
+        Returns:
+            CriticStep: A structure containing the critic's review, feedback, and acceptance decision
+        """
+        critic_step = CriticStep(start_time=time.time())
+
+        critic_request = f"""Please analyze the following agent reasoning and proposed code thoroughly:
+
+        AGENT REASONING AND CODE:
+        {model_output}
+
+        PARSED CODE THAT WILL BE EXECUTED:
+        ```python
+        {code_action}
+        ```
+
+        Leverage your analytical capabilities to evaluate:
+
+        Whether the reasoning is sound and fully addresses the problem.
+        If the code correctly implements the described approach.
+        Whether there are any bugs, edge cases, or logical errors.
+        If the solution is efficient and well-structured.
+        How well the solution meets the original requirements.
+        Provide a comprehensive analysis with specific details about strengths and weaknesses. If you find issues, explain exactly what they are and why they matter.
+
+        Your response MUST end with one of the following:
+
+        "ACCEPT: Your brief justification" - if the code is correct and addresses the requirements.
+        "NOT ACCEPT: Your Ssecific, detailed explanation of issues to fix" - if you found problems.
+        "NOT SURE: Why you are unsure" - if you could not provide feedback and the agent should proceed with caution.
+        Be specific and actionable in your feedback. Do not use generic placeholders."""
+            
+        try:
+            # Invoke the critic agent
+            critic_response = self.critic_agent.run(critic_request, reset=True)
+            critic_step.model_output_message = critic_response
+
+
+            if hasattr(critic_response, 'content'):
+                if isinstance(critic_response.content, list):
+                    critic_feedback = " ".join(map(str, critic_response.content)).strip()  # Convert list to string
+                else:
+                    critic_feedback = str(critic_response.content).strip()
+            else:
+                critic_feedback = str(critic_response).strip()
+
+            critic_step.feedback = critic_feedback
+
+            # Ensure feedback ends with an expected format
+            print(f'{critic_feedback.startswith}=') ##### Debug 
+            if not (critic_feedback.startswith("ACCEPT:") or 
+                    critic_feedback.startswith("NOT ACCEPT:") or 
+                    critic_feedback.startswith("NOT SURE:")):
+                self.logger.log(
+                    "Critic response did not conform to expected format. Requesting re-evaluation.",
+                    level=LogLevel.INFO,
+                )
+
+                retry_request = f"""Your response did not follow the required format or lacked sufficient detail.
+
+                    AGENT REASONING AND CODE:
+                    {model_output}
+
+                    PARSED CODE THAT WILL BE EXECUTED:
+                    ```python
+                    {code_action}
+                    ```
+
+                    Provide a proper response ending with:
+
+                    "ACCEPT: [Your reasoning]" if the code is correct.
+                    "NOT ACCEPT: [Specific, detailed explanation of issues]" if there are problems.
+                    "NOT SURE: [Why you are unsure]" if you cannot assess this properly.
+                    Do not use placeholders. Provide specific, actionable feedback."""
+                
+                retry_response = self.critic_agent.run(retry_request, reset=True)
+                
+                if hasattr(retry_response, 'content'):
+                    if isinstance(retry_response.content, list):
+                        retry_feedback = " ".join(map(str, retry_response.content)).strip()  # Convert list to string
+                    else:
+                        retry_feedback = str(retry_response.content).strip()
+                else:
+                    retry_feedback = str(retry_response).strip()
+
+                # Use retry response if it is properly formatted
+                if retry_feedback.startswith(("ACCEPT:", "NOT ACCEPT:", "NOT SURE:")):
+                    critic_feedback = retry_feedback
+                    critic_step.feedback = retry_feedback
+
+                else:
+                    # Provide a structured fallback if the retry still fails
+                    print('critic_feedback changed to not sure') ### debug
+                    critic_feedback = """NOT SURE: The proposed solution may need improvements:
+
+        1. Code correctness: The logic may have flaws that prevent it from working as intended
+        2. Problem coverage: The solution may not fully address all requirements or handle all cases
+        3. Error handling: Edge cases might not be properly handled
+        4. Implementation: There may be inefficiencies or structural issues in the approach
+
+        Please refine the solution considering these factors and re-evaluate."""
+                    critic_step.feedback = critic_feedback
+
+            # Determine acceptance based on final feedback
+            lower_feedback = critic_feedback.lower()
+            if lower_feedback.startswith("accept:"):
+                critic_step.accepted = True
+            elif lower_feedback.startswith("not accept:"):
+                critic_step.accepted = False  
+            else:
+                critic_step.accepted = False  # Default to rejection if unsure
+                # self.logger.log("Critic was unsure about the correctness of the solution. Proceed with caution.", level=LogLevel.INFO)
+
+
+            # Log final critic feedback
+            self.logger.log_markdown(
+                content=critic_step.feedback,
+                title="Critic Review:",
+                level=LogLevel.DEBUG,
+            )
+
+        except Exception as e:
+            critic_step.feedback = f"Error in critic review: {str(e)}"
+            critic_step.accepted = False  # Default to not accepting code
+            self.logger.log(
+
+                f"Error in critic review: {str(e)}. Defaulting to NOT accepting the code.",
+                level=LogLevel.INFO,
+            )
+
+        critic_step.end_time = time.time()
+        critic_step.duration = critic_step.end_time - critic_step.start_time
+
+        return critic_step
+
+
+__all__ = ["MultiStepAgent", "CodeAgent", "ToolCallingAgent", "AgentMemory", "CriticCodeAgent"]
