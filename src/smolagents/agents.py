@@ -31,7 +31,7 @@ from rich.rule import Rule
 from rich.text import Text
 
 from smolagents.agent_types import AgentAudio, AgentImage, handle_agent_output_types
-from smolagents.memory import ActionStep, AgentMemory, PlanningStep, SystemPromptStep, TaskStep, ToolCall
+from smolagents.memory import ActionStep, AgentMemory, PlanningStep, SystemPromptStep, TaskStep, ToolCall, CriticStep
 from smolagents.monitoring import (
     YELLOW_HEX,
     AgentLogger,
